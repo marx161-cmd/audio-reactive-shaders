@@ -1,0 +1,13 @@
+__pycache__/
+.venv/
+config.toml
+/textures
+video/rendered/
+tools/ispc_texcomp/
+# live runtime state written by the renderer / helpers
+active_shader.txt
+mouse_mode.txt
+camera_state.txt
+freefly_state.txt
+capture_state.txt
+steer_key.txt

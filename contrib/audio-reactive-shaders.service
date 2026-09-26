@@ -1,0 +1,27 @@
+# systemd --user unit for the live backdrop. Install:
+#   cp contrib/audio-reactive-shaders.service ~/.config/systemd/user/
+#   edit WorkingDirectory / ExecStart below to your checkout and python
+#   systemctl --user daemon-reload && systemctl --user enable --now audio-reactive-shaders
+[Unit]
+Description=Audio-reactive shader backdrop (renderer.py)
+After=graphical-session.target
+PartOf=graphical-session.target
+
+[Service]
+Type=simple
+WorkingDirectory=%h/audio-reactive-shaders
+Environment=DISPLAY=:0
+Environment=XDG_SESSION_TYPE=x11
+# Learn per-track beat maps from what's playing (MPRIS via playerctl):
+Environment=SHADER_BEAT_CACHE=1
+# AMD: the ACO shader compiler measurably helped here (Mesa radeonsi):
+# Environment=AMD_DEBUG=useaco
+ExecStartPre=/bin/mkdir -p %h/.cache/audio-reactive-shaders
+ExecStart=%h/audio-reactive-shaders/.venv/bin/python3 renderer.py
+Restart=always
+RestartSec=2
+StandardOutput=append:%h/.cache/audio-reactive-shaders/renderer.log
+StandardError=inherit
+
+[Install]
+WantedBy=graphical-session.target

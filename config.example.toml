@@ -1,0 +1,18 @@
+# Copy to config.toml (git-ignored) and edit. Every key is optional.
+
+[audio]
+# Delay the audio analysis to match a speaker that plays late (Bluetooth,
+# network speakers). 0 = speakers play in real time.
+delay_ms = 0
+# Or: a KEY=VALUE file re-read live, so a calibration tool can update the
+# delay while the renderer runs. Takes precedence over delay_ms when set.
+# delay_file = "~/.config/av-sync.env"
+# delay_file_key = "VIDEO_DELAY_MS"
+
+[display]
+# By default every connected output (xrandr) gets a backdrop window showing
+# its crop of the square canvas. Restrict to specific outputs:
+# outputs = ["DP-1", "HDMI-A-1"]
+# Window size if xrandr can't be queried at all:
+# fallback_w = 1920
+# fallback_h = 1080

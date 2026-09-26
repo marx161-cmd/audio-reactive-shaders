@@ -1,0 +1,43 @@
+#!/usr/bin/env bash
+# DESC: Nudge the shader-backdrop orrery camera (elevation/yaw/zoom) from a keybinding
+# TAGS: desktop, shader, wallpaper, camera, orrery
+# ARGS: up|down|left|right|in|out|reset|show [step]
+#
+# Writes camera_state.txt in the repo root (this script lives in contrib/); renderer.py hot-reads it
+# (cached on mtime) and pushes u_cam_elev / u_cam_yaw / u_cam_zoom to the
+# shader. Bind this to WM keys -- the backdrop is an override-redirect window
+# that never receives focus, so it cannot be sent key events directly, and
+# polling global key state would fire on keys pressed in other applications.
+set -euo pipefail
+
+STATE="$(cd "$(dirname "$(readlink -f "$0")")/.." && pwd)/camera_state.txt"
+DEF_ELEV=0.58
+DEF_YAW=0.35
+DEF_ZOOM=1.0
+
+ACTION="${1:-show}"
+STEP="${2:-0.08}"
+
+read -r ELEV YAW ZOOM < "$STATE" 2>/dev/null || true
+ELEV="${ELEV:-$DEF_ELEV}"; YAW="${YAW:-$DEF_YAW}"; ZOOM="${ZOOM:-$DEF_ZOOM}"
+
+calc() { awk -v a="$1" -v b="$2" 'BEGIN{printf "%.4f", a+b}'; }
+clamp() { awk -v v="$1" -v lo="$2" -v hi="$3" 'BEGIN{if(v<lo)v=lo; if(v>hi)v=hi; printf "%.4f", v}'; }
+
+case "$ACTION" in
+  # No clamp: as of v4.9 the shader accumulates a quaternion, so there is no
+  # gimbal lock and the camera can tumble all the way around. ELEV/YAW here are
+  # just monotonic nudge counters that buffer A reads as per-press deltas.
+  up)    ELEV=$(calc "$ELEV"  "$STEP") ;;
+  down)  ELEV=$(calc "$ELEV" "-$STEP") ;;
+  left)  YAW=$(calc "$YAW"  "$STEP") ;;
+  right) YAW=$(calc "$YAW" "-$STEP") ;;
+  in)    ZOOM=$(clamp "$(calc "$ZOOM"  "$STEP")" 0.35 3.0) ;;
+  out)   ZOOM=$(clamp "$(calc "$ZOOM" "-$STEP")" 0.35 3.0) ;;
+  reset) ELEV=$DEF_ELEV; YAW=$DEF_YAW; ZOOM=$DEF_ZOOM ;;
+  show)  echo "elev=$ELEV yaw=$YAW zoom=$ZOOM"; exit 0 ;;
+  *)     echo "usage: $(basename "$0") up|down|left|right|in|out|reset|show [step]" >&2; exit 2 ;;
+esac
+
+printf '%s %s %s\n' "$ELEV" "$YAW" "$ZOOM" > "$STATE"
+echo "elev=$ELEV yaw=$YAW zoom=$ZOOM"

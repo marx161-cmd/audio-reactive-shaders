@@ -1,0 +1,31 @@
+{
+  "buffers": [
+    "A"
+  ],
+  "wiring": {
+    "A": {
+      "0": {
+        "type": "self"
+      }
+    },
+    "Image": {
+      "0": {
+        "type": "buffer",
+        "id": "A"
+      }
+    }
+  },
+  "static_textures": {
+    "u_dwarfmap": "textures/pulsar_orrery/dwarf.npy",
+    "u_chromomap": "textures/pulsar_orrery/chromo.npy",
+    "u_giantmap": "textures/pulsar_orrery/giant.npy",
+    "u_rockmap": "textures/pulsar_orrery/rock.npy",
+    "u_ringprof": "textures/pulsar_orrery/ringprof.npy",
+    "u_kerrpaths": "textures/kerr_v7/kn/paths32.npy",
+    "u_knsky": "textures/kerr_v7/kn/sky.npy",
+    "u_kntable": "textures/kerr_v7/kn_disk_table.npy",
+    "u_skycube": "textures/starfield/sky64k/sky64k.json"
+  },
+  "fps": 30,
+  "static_texture_filters": {}
+}

@@ -1,0 +1,12 @@
+# live renderer + video pipeline (Python 3.11+)
+glfw>=2.10
+moderngl>=5.12
+numpy>=2.0
+pypng
+Pillow
+python-xlib
+scipy
+# optional, bakes only:
+#   OpenEXR   (skycube_unpack.py)
+#   torch     (skycube_bake.py, ROCm or CUDA build)
+#   modal     (kn_bake_modal.py, runs on a Modal cloud GPU)

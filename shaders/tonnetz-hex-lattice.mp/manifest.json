@@ -1,0 +1,11 @@
+{
+  "buffers": ["A"],
+  "wiring": {
+    "A": {
+      "0": { "type": "self" }
+    },
+    "Image": {
+      "0": { "type": "buffer", "id": "A" }
+    }
+  }
+}
