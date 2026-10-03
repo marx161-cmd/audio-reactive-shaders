@@ -125,3 +125,13 @@ bake for zeroed samples before using it.
 ## License
 
 GPL-3.0-or-later. See `LICENSE`.
+
+## Related projects
+
+- [easyeffects-shader-bands](https://github.com/marx161-cmd/easyeffects-shader-bands) — patched EasyEffects that produces the 120-band `/dev/shm/shader_bands` feed these shaders read.
+
+## Demo
+
+<!-- Upload a shader music video and paste the link here, e.g. (replace VIDEOID):
+[![Watch the shader music video](https://img.youtube.com/vi/VIDEOID/maxresdefault.jpg)](https://youtu.be/VIDEOID)
+-->
