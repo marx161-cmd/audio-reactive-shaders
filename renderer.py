@@ -56,6 +56,7 @@ import beat_session
 import beat_track
 import stem_split
 from audio_texture import AudioTexReader, WIDTH as AUDIO_TEX_WIDTH
+import importlib.util
 
 # Real Shadertoy audio sample rate our native EasyEffects plugin actually
 # runs at (see shader-musicvideo's shader_bands.cpp) -- fed as iSampleRate
@@ -212,6 +213,16 @@ CAMERA_FILE = os.path.join(os.path.dirname(__file__), "camera_state.txt")
 # here as six floats, written when they change and reloaded at startup.
 FREEFLY_FILE = os.path.join(os.path.dirname(__file__), "freefly_state.txt")
 FREEFLY_KEYS = ("yaw", "pitch", "roll", "r", "u", "f")
+# 2026-09-28: phone gyro as a second steering hand. cybersyn-hid-relay
+# (--gyro-target shader) writes "<active> <gx> <gy>" here while vol-down is held
+# on the Pixel: the phone's pointing offset since the press, already in canvas
+# px (y up) like a cursor. Fed into the SAME path as Super + mouse below, so
+# every shader that steers by mouse steers by gyro with no shader change.
+# 4th value (2026-09-28): the twist about the pointing axis, as px of Super +
+# Ctrl vertical drag (u_cam_move.z: nebulabrot zoom, free-fly forward/back).
+# Treated as released when the file goes stale (relay died mid-hold).
+GYRO_FILE = os.path.join(os.path.dirname(__file__), "gyro_state.txt")
+GYRO_STALE_S = 1.0
 # 2026-09-23: full-canvas video capture (scope.md "Music-session video capture").
 # Same polled-state-file convention as the files above. Written by
 # capture_session.py, which watches MPRIS; the recording itself lives in
@@ -229,6 +240,62 @@ def load_freefly():
     except (OSError, ValueError):
         pass
     return out
+
+
+# 2026-09-27: opt-in per-shader state that survives reloads/restarts. A
+# multipass shader lists `"persist": {"buffer": "A"}` in its manifest; texel
+# (0,0) of that buffer is read back every PERSIST_SECONDS and written here, and
+# handed back to the shader as `uniform vec4 u_persist0` (+ `u_persist_valid`
+# 1.0 when a saved value exists) so its seed frame can restore it. First user:
+# nebulabrot.mp's parked view (centre, zoom, rotation).
+PERSIST_DIR = os.path.join(os.path.dirname(__file__), "shader_state")
+PERSIST_SECONDS = 2.0
+# 2026-09-27: `uniform float u_autozoom` (0/1), toggled by Super+Z via i3 ->
+# ~/bin/backdrop-autozoom. A WM binding, not polled keys: see CAMERA_FILE's note.
+AUTOZOOM_FILE = os.path.join(os.path.dirname(__file__), "autozoom.txt")
+# 2026-09-27: dive path -- ~/bin/backdrop-dive writes the target view
+# here ("re im zoom rot id"); passed as u_cam_target (vec4) + u_cam_target_id.
+CAM_TARGET_FILE = os.path.join(os.path.dirname(__file__), "cam_target.txt")
+# 2026-09-27: auto-dive -- `~/bin/backdrop-dive auto` (Super+Up) flips
+# autodive.txt 0/1. While on, every AUTODIVE_BEATS beats of the beat clock the
+# renderer sends the camera on to the next dive stop (the shader's flight takes
+# 16 beats, then it rests 16 at the stop). Past the last stop it continues with
+# stop 1: the last stop is nebulabrot's loop copy, whose swap has by then put
+# the view back at the start. A manual jump (Super+Left/Right) restarts the count.
+AUTODIVE_FILE = os.path.join(os.path.dirname(__file__), "autodive.txt")
+DIVE_PATH_FILE = os.path.join(PERSIST_DIR, "nebulabrot_dive.txt")
+DIVE_IDX_FILE = os.path.join(PERSIST_DIR, "nebulabrot_dive_idx.txt")
+AUTODIVE_BEATS = 32.0
+
+
+def persist_path(mp):
+    return os.path.join(PERSIST_DIR, os.path.basename(mp["dir"].rstrip("/")) + ".txt")
+
+
+def load_persist(mp):
+    try:
+        with open(persist_path(mp)) as fh:
+            vals = [float(v) for v in fh.read().split()[:4]]
+        return tuple(vals) if len(vals) == 4 else None
+    except (OSError, ValueError):
+        return None
+
+
+def save_persist(mp):
+    spec = mp["manifest"].get("persist")
+    b = mp["buffers"].get((spec or {}).get("buffer", ""))
+    if b is None:
+        return
+    raw = b["fbo"][b["cur"]].read(viewport=(0, 0, 1, 1), components=4, dtype="f4")
+    vals = np.frombuffer(raw, dtype=np.float32)
+    if not np.all(np.isfinite(vals)):
+        return
+    os.makedirs(PERSIST_DIR, exist_ok=True)
+    tmp = persist_path(mp) + ".tmp"
+    with open(tmp, "w") as fh:
+        fh.write(" ".join("%.9g" % v for v in vals) + "\n")
+    os.replace(tmp, persist_path(mp))
+    return tuple(float(v) for v in vals)
 
 
 def save_freefly(cam):
@@ -401,44 +468,38 @@ def detect_outputs():
 # The Pixel head (1280x2856) is now BIGGER than the canvas, which is the case
 # crop_for_spec below exists to handle correctly: it grabs a 1080x2410 region
 # -- the same aspect ratio, since 1080/2410 = 0.4481 and 1280/2856 = 0.4482 --
-# and scales that up wholesale, uniformly. The two 1920x1080 appliance heads
-# still take a 1:1 centre crop, and because the canvas is smaller they now
-# cover more of it, i.e. they see more of the scene. Both are intended.
+# and scales that up wholesale, uniformly. Since 2026-09-27 the same rule
+# covers every head (canvas_per_screen: long side = full canvas), so the two
+# Dell appliance heads are downscaled ~0.8x instead of taking a 1:1 crop.
 CANVAS_W = 2410
 CANVAS_H = 2410
 
 
-def crop_for_spec(spec):
-    """UV offset+scale for blitting this output's share of the shared canvas.
+def canvas_per_screen(spec):
+    """Canvas pixels per screen pixel for this output -- ONE uniform factor.
 
-    An output that FITS inside the canvas takes a 1:1 centre crop, exactly as
-    before. An output BIGGER than the canvas takes the largest crop with its
-    OWN aspect ratio and is scaled up uniformly.
-
-    The previous version clamped each axis independently
-    (`min(1.0, w/CANVAS_W)` and the same for h), which for an output bigger on
-    only one axis stretched that axis alone -- e.g. a 1280x2856 head against a
-    2410 canvas sampled full height and 1:1 width, then stretched height by
-    1.185x on its own. That is a distortion, not a rescale, and it is what
-    renderer.py's startup warning was describing. Deriving both axes from a
-    single factor `k` makes the scale uniform by construction.
-
-    Defined once at module level because this was previously duplicated
-    verbatim in two places (presenter setup and sync_layout) that had to agree.
+    2026-09-27 (user): every output's LONG side spans the full canvas, the
+    short side is a centred crop. The canvas is square because the Pixel
+    rotates (portrait/landscape) and the Dells are one of each, so "long side
+    = whole canvas" is the one rule that treats them all alike. Heads smaller
+    than the canvas are downscaled (the blit supersamples), bigger ones
+    upscaled. Before this, heads that fit took a 1:1 centre crop, so the Dells
+    showed only 45% x 80% of what was rendered.
     """
-    k = min(1.0, CANVAS_W / spec["w"], CANVAS_H / spec["h"])
+    return CANVAS_W / max(spec["w"], spec["h"])
+
+
+def crop_for_spec(spec):
+    """UV offset+scale for blitting this output's share of the shared canvas
+    (see canvas_per_screen: long side = full canvas, uniform scale, centred).
+    Used by presenter setup and sync_layout, which must agree.
+    """
+    k = canvas_per_screen(spec)
     uscale = min(1.0, (spec["w"] * k) / CANVAS_W)
     vscale = min(1.0, (spec["h"] * k) / CANVAS_H)
     return ((1.0 - uscale) / 2.0, (1.0 - vscale) / 2.0), (uscale, vscale)
 
 OUTPUTS = detect_outputs()
-
-for _o in OUTPUTS:
-    if _o["w"] > CANVAS_W or _o["h"] > CANVAS_H:
-        print(f"WARNING: output {_o['name']} is {_o['w']}x{_o['h']}, larger than "
-              f"the {CANVAS_W}x{CANVAS_H} canvas -- its crop is clamped to the "
-              f"canvas, so it will show the canvas scaled rather than a "
-              f"1:1 centre crop.", file=sys.stderr)
 
 BLIT_VERT = """
 #version 330
@@ -455,10 +516,16 @@ BLIT_FRAG = """
 uniform sampler2D src_tex;
 uniform vec2 uv_offset;
 uniform vec2 uv_scale;
+uniform vec2 tap;       // a quarter output pixel, in canvas uv: 4-tap supersample
 in vec2 v_uv;
 out vec4 fragColor;
 void main() {
-    vec4 col = texture(src_tex, uv_offset + v_uv * uv_scale);
+    // 4 taps per output pixel: heads smaller than the canvas are DOWNscaled
+    // (~0.8x for the Dells), and a single bilinear tap would skip texels, so
+    // fine detail (star fields) would shimmer.
+    vec2 uv = uv_offset + v_uv * uv_scale;
+    vec4 col = 0.25 * (texture(src_tex, uv + vec2(-tap.x, -tap.y)) + texture(src_tex, uv + vec2(tap.x, -tap.y))
+                     + texture(src_tex, uv + vec2(-tap.x, tap.y)) + texture(src_tex, uv + vec2(tap.x, tap.y)));
     // canvas_tex (every shader's render target) is 8-bit with no dtype
     // override, so any smooth in-shader gradient (lighting falloff, glow,
     // fog, a tonemap curve) quantizes to 256 visible steps here, on the way
@@ -650,15 +717,37 @@ def load_static_data_texture(ctx, path, filter_mode=None):
     uint8 arrays upload as normalized u8 (0..1 in-shader); float32 arrays
     upload as f4. No mipmaps -- callers needing exact tile addressing
     (an atlas) should sample with textureLod(..., 0.0)."""
+    # 2026-10-04: a static texture may be a plain image file instead of a
+    # pre-baked .npy -- so manifest.json's "static_textures" can point straight
+    # at a .png/.jpg and there is no separate bake step to forget. Any
+    # non-.npy path goes to load_static_image_texture below, which applies the
+    # same GL row-flip and honours the same "static_texture_filters" as the
+    # .npy path (so an image and its baked .npy look identical).
+    if not path.lower().endswith(".npy"):
+        return load_static_image_texture(ctx, path, filter_mode)
     # 2026-09-21: (L, H, W, C) float32 -> a 2D texture ARRAY (sampler2DArray),
     # uploaded layer by layer from a memmap so a multi-GB bake (kerr_bake.py,
     # ~3 GB) never sits in RAM, and CACHED across hot reloads -- re-uploading
     # it on every shader edit would stall the backdrop for seconds.
     head = np.load(path, mmap_mode="r")
+    if head.ndim == 4 and filter_mode == "volume":
+        return load_static_volume_texture(ctx, path, head)
     if head.ndim == 4:
         return load_static_array_texture(ctx, path, head, filter_mode)
     del head
-    arr = np.load(path)
+    # 2026-09-27: big 2D fields (the 16k Nebulabrot, 1.6 GB) are cached across
+    # hot reloads like the array textures -- re-uploading on every shader save
+    # stalls the backdrop for seconds.
+    big = os.path.getsize(path) > (256 << 20)
+    key = (id(ctx), path, filter_mode)
+    mtime = os.path.getmtime(path)
+    if big:
+        hit = _ARRAY_TEX_CACHE.get(key)
+        if hit is not None and hit[0] == mtime:
+            return hit[1]
+        if hit is not None:
+            hit[1].release()
+    arr = np.load(path, mmap_mode="r") if big else np.load(path)
     # (H, W) stays single-channel as before; (H, W, C) uploads C components, so a
     # table of vectors is ONE fetch per element instead of one per component.
     if arr.ndim == 2:
@@ -668,8 +757,27 @@ def load_static_data_texture(ctx, path, filter_mode=None):
         h, w, comps = arr.shape
     else:
         raise ValueError(f"{path}: expected (H,W) or (H,W,C<=4), got shape {arr.shape}")
-    arr = np.ascontiguousarray(arr)
-    if arr.dtype == np.uint8:
+    if big:
+        # 2026-09-27: one-shot upload of the 1.6 GB Nebulabrot fails in radeonsi
+        # ("failed to create temporary texture to hold untiled copy"), so big
+        # textures are allocated empty and filled in ~128 MB row slabs from the
+        # memmap (never the whole array in RAM either).
+        dt = {np.uint8: "f1", np.float32: "f4", np.float16: "f2"}.get(arr.dtype.type)
+        if dt is None:
+            raise ValueError(f"{path}: unsupported dtype {arr.dtype}")
+        tex = ctx.texture((w, h), comps, dtype=dt)
+        # 2026-09-28: slabs alone weren't enough -- cold starts with nebulabrot
+        # still died in amdgpu_bo_alloc (-12) on a 128 MB GTT staging buffer: the
+        # writes are queued, so every slab's staging copy stays allocated until the
+        # GPU gets round to it, and five 2 GB textures fill the 2 GB GTT
+        # (amdgpu.gttsize=2048 is global, the dGPU gets it too). 64 MB slabs, and
+        # ctx.finish() after each so its staging is freed before the next.
+        rows = max(1, (64 << 20) // (w * comps * arr.itemsize))
+        for y0 in range(0, h, rows):
+            y1 = min(h, y0 + rows)
+            tex.write(np.ascontiguousarray(arr[y0:y1]).tobytes(), viewport=(0, y0, w, y1 - y0))
+            ctx.finish()
+    elif arr.dtype == np.uint8:
         tex = ctx.texture((w, h), comps, arr.tobytes())
     elif arr.dtype == np.float32:
         tex = ctx.texture((w, h), comps, arr.tobytes(), dtype="f4")
@@ -702,10 +810,51 @@ def load_static_data_texture(ctx, path, filter_mode=None):
         tex.filter = (moderngl.LINEAR, moderngl.LINEAR)
     tex.repeat_x = filter_mode == "linear_wrap"
     tex.repeat_y = False
+    if big:
+        _ARRAY_TEX_CACHE[key] = (mtime, tex)
     return tex
 
 
 _ARRAY_TEX_CACHE = {}   # (id(ctx), path) -> (mtime, texture); survives reloads
+
+
+def load_static_image_texture(ctx, path, filter_mode=None):
+    """A static texture given as a plain image file (.png/.jpg/...) rather than
+    a .npy -- see the dispatch in load_static_data_texture. Decodes with PIL
+    and applies the GL row-flip the .npy path expects at prep time, so a PNG
+    and its baked .npy look identical. Cached by mtime in the same
+    _ARRAY_TEX_CACHE the big .npy fields use, so a hot reload that didn't
+    touch the image does not re-decode it; honours the manifest's
+    "static_texture_filters" exactly like the .npy path."""
+    key = (id(ctx), path, filter_mode)
+    mtime = os.path.getmtime(path)
+    hit = _ARRAY_TEX_CACHE.get(key)
+    if hit is not None and hit[0] == mtime:
+        return hit[1]
+    if hit is not None:
+        hit[1].release()
+    img = Image.open(path)
+    if "A" in img.getbands():
+        arr = np.asarray(img.convert("RGBA"))
+    elif img.mode in ("L", "1", "I", "F"):
+        arr = np.asarray(img.convert("L"))
+    else:
+        arr = np.asarray(img.convert("RGB"))
+    arr = np.ascontiguousarray(arr[::-1])   # GL texture origin is bottom-left
+    h, w = arr.shape[:2]
+    comps = 1 if arr.ndim == 2 else arr.shape[2]
+    tex = ctx.texture((w, h), comps, arr.tobytes())
+    if filter_mode == "nearest":
+        tex.filter = (moderngl.NEAREST, moderngl.NEAREST)
+    elif filter_mode == "linear_mip":
+        tex.build_mipmaps()
+        tex.filter = (moderngl.LINEAR_MIPMAP_LINEAR, moderngl.LINEAR_MIPMAP_LINEAR)
+    else:
+        tex.filter = (moderngl.LINEAR, moderngl.LINEAR)
+    tex.repeat_x = filter_mode == "linear_wrap"
+    tex.repeat_y = False
+    _ARRAY_TEX_CACHE[key] = (mtime, tex)
+    return tex
 
 
 def load_static_array_texture(ctx, path, mm, filter_mode=None):
@@ -737,6 +886,38 @@ def load_static_array_texture(ctx, path, mm, filter_mode=None):
     tex.repeat_y = False
     _ARRAY_TEX_CACHE[key] = (mtime, tex)
     print(f"array texture {path}: {layers}x{h}x{w}x{comps} f32 "
+          f"({mm.nbytes / 1e9:.2f} GB) uploaded", file=sys.stderr)
+    return tex
+
+
+def load_static_volume_texture(ctx, path, mm):
+    # 2026-09-27: (D, H, W, C) f16/f32 -> a real 3D texture (sampler3D), for
+    # manifest filter "volume": the periodic turbulence box (turb_bake_modal.py).
+    # LINEAR with a mip chain (a fly-through samples far cells at a coarse
+    # footprint) and REPEAT on all three axes -- the bake is periodic, so the
+    # camera can fly forever without a seam. Axis order: W = s (x), H = t (y),
+    # D = r (z). Cached across hot reloads like the array textures.
+    key = (id(ctx), path, "volume")
+    mtime = os.path.getmtime(path)
+    hit = _ARRAY_TEX_CACHE.get(key)
+    if hit is not None and hit[0] == mtime:
+        return hit[1]
+    if hit is not None:
+        hit[1].release()
+    d, h, w, comps = mm.shape
+    if mm.dtype not in (np.float32, np.float16) or comps not in (1, 2, 3, 4):
+        raise ValueError(f"{path}: expected float32/float16 (D,H,W,C<=4), got {mm.dtype} {mm.shape}")
+    f16 = mm.dtype == np.float16
+    tex = ctx.texture3d((w, h, d), comps, dtype="f2" if f16 else "f4")
+    slab = max(1, (256 << 20) // (h * w * comps * mm.itemsize))   # ~256 MB per write
+    for z0 in range(0, d, slab):
+        z1 = min(d, z0 + slab)
+        tex.write(np.ascontiguousarray(mm[z0:z1]).tobytes(), viewport=(0, 0, z0, w, h, z1 - z0))
+    tex.build_mipmaps()
+    tex.filter = (moderngl.LINEAR_MIPMAP_LINEAR, moderngl.LINEAR)
+    tex.repeat_x = tex.repeat_y = tex.repeat_z = True
+    _ARRAY_TEX_CACHE[key] = (mtime, tex)
+    print(f"volume texture {path}: {w}x{h}x{d}x{comps} {mm.dtype} "
           f"({mm.nbytes / 1e9:.2f} GB) uploaded", file=sys.stderr)
     return tex
 
@@ -950,6 +1131,26 @@ EXTRA_STATIC_TEXTURE_UNIT_START = 9
 STEMS_UNIT = 7
 STEM_ROWS = 4
 
+# manifest.json's optional "compute" field (2026-10-02, scope.md "fluid ball"):
+#     "compute": {"script": "sim.py"}
+# A per-shader compute stage. The shader's own folder holds the logic -- a
+# Python step script (setup(api) / step(api, dt)) plus its .comp kernels --
+# and the renderer only provides the generic plumbing (ComputeStage below):
+# compiling kernels, allocating 3D textures, binding images/samplers for a
+# dispatch, broadcasting the per-frame uniforms, and handing chosen textures to
+# the buffer/Image passes as ordinary samplers. Nothing shader-specific lives
+# here (the v11 disk's old one-off hook was moved out to
+# shaders/_attic/schwarz_orrery_v11.mp/NOTE_disk_compute_hook.md).
+#
+# Exposed textures sit at fixed units from here up, clear of
+# EXTRA_STATIC_TEXTURE_UNIT_START's range (currently 9..17). Samplers bound
+# for a single dispatch use a scratch range above that, so a dispatch never
+# disturbs what the render passes see.
+COMPUTE_EXPOSE_UNIT_START = 24
+COMPUTE_SCRATCH_UNIT_START = 40
+# How often the stage's GPU time is measured and logged (seconds).
+COMPUTE_TIMING_PERIOD = 10.0
+
 # How often the separation is recomputed, in the reader thread. The result is
 # a windowed median over ~400 ms, so it moves slowly; recomputing it at the
 # full 188 Hz block rate would burn CPU to change almost nothing. 60 Hz is
@@ -1019,6 +1220,191 @@ def load_extra_static_textures(ctx, manifest):
         result.append((uniform_name, tex, unit))
         unit += 1
     return result
+
+
+_COMPUTE_FORMATS = {   # GLSL image format -> (components, moderngl dtype)
+    "rgba32f": (4, "f4"), "rgba16f": (4, "f2"),
+    "rg32f": (2, "f4"), "rg16f": (2, "f2"),
+    "r32f": (1, "f4"), "r16f": (1, "f2"),
+}
+
+
+class ComputeStage:
+    """The generic compute stage -- see COMPUTE_EXPOSE_UNIT_START. Built by
+    load_multipass() from manifest.json's "compute" field; raises on any
+    failure (missing script, kernel compile error), same contract as the
+    rest of load_multipass(), so a broken edit keeps the last good shader.
+
+    The script gets this object as `api`:
+        api.kernel(file, variant=None, defines=None) -> compiled kernel. The
+            source is prefixed with "#version 460", "#define K_<variant>" and
+            compute_common.glsl (if the folder has one), so one .comp file can
+            hold several kernels behind #ifdef K_<name>.
+        api.texture3d((x, y, z), fmt) -> 3D texture, fmt in _COMPUTE_FORMATS,
+            linear filtering, clamp-to-edge.
+        api.texture2d((x, y), fmt, data=None, nearest=False, wrap=False) -> 2D
+            texture (a lookup map, or a 2D sim field; wrap=True for periodic).
+        api.run(kernel, groups, images={binding: tex}, samplers={name: tex},
+                uniforms={name: value}) -> one dispatch + memory barrier.
+        api.set(kernel, {name: value}) -> set uniforms without dispatching.
+        api.expose(uniform, tex) -> the buffer/Image passes see `tex` under
+            `uniform` from now on (call again whenever a ping-pong swaps).
+        api.render_uniform(name, value) -> set a uniform on the render passes.
+        api.buffer(letter) -> that buffer pass's latest texture (last frame's).
+        api.state -> dict the script keeps its own data in.
+    Every kernel also gets the same per-frame uniforms as the render passes
+    (iTime, iTimeDelta, iFrame, u_bass, ...) and the `bands`/`stems` samplers.
+    """
+
+    def __init__(self, ctx, mp_dir, spec):
+        self.ctx = ctx
+        self.dir = mp_dir
+        self.state = {}
+        self._kernels = []
+        self._textures = []
+        self._exposed = {}          # uniform -> [unit, texture]
+        self._render_progs = []
+        self._mp = None
+        self._timing_last = 0.0
+        self.gpu_ms = None
+        common_path = os.path.join(mp_dir, "compute_common.glsl")
+        self._common = open(common_path).read() if os.path.isfile(common_path) else ""
+        script_path = os.path.join(mp_dir, spec["script"])
+        mod_spec = importlib.util.spec_from_file_location(
+            f"compute_{os.path.basename(mp_dir).replace('.', '_')}", script_path)
+        self._module = importlib.util.module_from_spec(mod_spec)
+        mod_spec.loader.exec_module(self._module)
+        self._module.setup(self)
+        nbytes = sum(math.prod(t.size) * t.components * (2 if t.dtype == "f2" else 4)
+                     for t in self._textures)
+        print(f"compute stage: {script_path} ({len(self._kernels)} kernels, "
+              f"{len(self._textures)} textures, {nbytes / 2**20:.0f} MiB)", file=sys.stderr)
+
+    # ---- script API ----
+    def kernel(self, file, variant=None, defines=None):
+        head = "#version 460\n"
+        if variant:
+            head += f"#define K_{variant} 1\n"
+        for k, v in (defines or {}).items():
+            head += f"#define {k} {v}\n"
+        src = head + self._common + "\n" + open(os.path.join(self.dir, file)).read()
+        prog = self.ctx.compute_shader(src)
+        for name, unit in (("bands", MP_BANDS_UNIT), ("stems", STEMS_UNIT)):
+            try:
+                prog[name].value = unit
+            except KeyError:
+                pass
+        self._kernels.append(prog)
+        return prog
+
+    def texture3d(self, size, fmt):
+        comps, dtype = _COMPUTE_FORMATS[fmt]
+        t = self.ctx.texture3d(tuple(size), comps, dtype=dtype)
+        t.filter = (moderngl.LINEAR, moderngl.LINEAR)
+        t.repeat_x = t.repeat_y = t.repeat_z = False
+        self._textures.append(t)
+        return t
+
+    def texture2d(self, size, fmt, data=None, nearest=False, wrap=False):
+        comps, dtype = _COMPUTE_FORMATS[fmt]
+        t = self.ctx.texture(tuple(size), comps, data=data, dtype=dtype)
+        f = moderngl.NEAREST if nearest else moderngl.LINEAR
+        t.filter = (f, f)
+        t.repeat_x = t.repeat_y = wrap
+        self._textures.append(t)
+        return t
+
+    def run(self, kernel, groups, images=None, samplers=None, uniforms=None):
+        for binding, tex in (images or {}).items():
+            tex.bind_to_image(binding, read=True, write=True)
+        for i, (name, tex) in enumerate((samplers or {}).items()):
+            tex.use(location=COMPUTE_SCRATCH_UNIT_START + i)
+            try:
+                kernel[name].value = COMPUTE_SCRATCH_UNIT_START + i
+            except KeyError:   # declared but unused -> compiled out
+                pass
+        self.set(kernel, uniforms or {})
+        kernel.run(*groups)
+        self.ctx.memory_barrier()
+
+    def set(self, kernel, uniforms):
+        for name, val in uniforms.items():
+            try:
+                kernel[name].value = val
+            except KeyError:
+                pass
+
+    def expose(self, uniform, tex):
+        if uniform not in self._exposed:
+            unit = COMPUTE_EXPOSE_UNIT_START + len(self._exposed)
+            self._exposed[uniform] = [unit, tex]
+            for p in self._render_progs:
+                try:
+                    p[uniform].value = unit
+                except KeyError:
+                    pass
+        self._exposed[uniform][1] = tex
+        tex.use(location=self._exposed[uniform][0])
+
+    def render_uniform(self, name, value):
+        """Set a uniform on the buffer/Image passes (e.g. a blend weight the sim decides)."""
+        for p in self._render_progs:
+            try:
+                p[name].value = value
+            except KeyError:
+                pass
+
+    def buffer(self, letter):
+        b = self._mp["buffers"][letter]
+        return b["tex"][b["cur"]]
+
+    # ---- renderer side ----
+    def attach(self, mp, render_progs):
+        self._mp = mp
+        self._render_progs = render_progs
+        for uniform, (unit, tex) in self._exposed.items():
+            tex.use(location=unit)
+            for p in render_progs:
+                try:
+                    p[uniform].value = unit
+                except KeyError:
+                    pass
+
+    def programs(self):
+        return self._kernels
+
+    def step(self, dt, now):
+        timed = now - self._timing_last > COMPUTE_TIMING_PERIOD
+        if timed:
+            self._timing_last = now
+            q = self.ctx.query(time=True)
+            with q:
+                self._module.step(self, dt)
+            self.gpu_ms = q.elapsed / 1e6
+            print(f"compute stage: {self.gpu_ms:.2f} ms GPU time", file=sys.stderr)
+        else:
+            self._module.step(self, dt)
+        # the dispatches rebound units; restore what the render passes read
+        for unit, tex in self._exposed.values():
+            tex.use(location=unit)
+
+    def release(self):
+        for k in self._kernels:
+            k.release()
+        for t in self._textures:
+            t.release()
+
+
+def load_compute_stage(ctx, mp_dir, manifest):
+    spec = manifest.get("compute")
+    if not spec:
+        return None
+    if "script" not in spec:
+        # the pre-2026-10-02 disk-only format (v11): no longer supported here
+        print(f"compute: {mp_dir} uses the old disk-only \"compute\" format, ignored "
+              f"(see shaders/_attic/schwarz_orrery_v11.mp/NOTE_disk_compute_hook.md)", file=sys.stderr)
+        return None
+    return ComputeStage(ctx, mp_dir, spec)
 
 
 def mp_newest_mtime(mp_dir):
@@ -1204,7 +1590,9 @@ def load_multipass(ctx, vbo, mp_dir):
             except KeyError:
                 pass
 
-    return {
+    compute = load_compute_stage(ctx, mp_dir, manifest)
+
+    mp = {
         "dir": mp_dir, "manifest": manifest,
         "buffers": buffers,
         "image_prog": image_prog, "image_vao": image_vao,
@@ -1213,7 +1601,11 @@ def load_multipass(ctx, vbo, mp_dir):
         "static_textures": static_textures,
         "extra_static_textures": extra_static,
         "live_audio_channels": live_audio_channels,
+        "compute": compute,
     }
+    if compute is not None:
+        compute.attach(mp, extra_progs)
+    return mp
 
 
 def release_multipass(mp):
@@ -1232,6 +1624,8 @@ def release_multipass(mp):
     for _name, tex, _unit in mp["extra_static_textures"]:
         if not is_cached_array_texture(tex):   # cached arrays outlive reloads
             tex.release()
+    if mp.get("compute") is not None:
+        mp["compute"].release()
 
 
 def bind_mp_wiring(prog, channels, mp, audio_channel_tex, pass_name):
@@ -1286,8 +1680,8 @@ def render_multipass(ctx, mp, canvas_fbo, audio_channel_tex):
 
 
 def create_output_window(spec, share=None):
-    glfw.window_hint(glfw.CONTEXT_VERSION_MAJOR, 3)
-    glfw.window_hint(glfw.CONTEXT_VERSION_MINOR, 3)
+    glfw.window_hint(glfw.CONTEXT_VERSION_MAJOR, 4)
+    glfw.window_hint(glfw.CONTEXT_VERSION_MINOR, 6)
     glfw.window_hint(glfw.OPENGL_PROFILE, glfw.OPENGL_CORE_PROFILE)
     glfw.window_hint(glfw.DECORATED, False)
     glfw.window_hint(glfw.FLOATING, True)
@@ -1350,7 +1744,10 @@ def main():
         # just the one program in single-pass mode, every buffer pass plus
         # Image in multipass mode (see render_multipass()).
         if mp is not None:
-            return [b["prog"] for b in mp["buffers"].values()] + [mp["image_prog"]]
+            progs = [b["prog"] for b in mp["buffers"].values()] + [mp["image_prog"]]
+            if mp.get("compute") is not None:
+                progs += mp["compute"].programs()
+            return progs
         return [prog]
 
     def set_uniform(name, value):
@@ -1723,7 +2120,7 @@ def main():
         # somewhere the picture isn't: when the head is bigger than the canvas
         # the mapping is not a plain centred offset any more, it is offset
         # PLUS the scale that crop_for_spec picked.
-        k = min(1.0, CANVAS_W / primary_spec["w"], CANVAS_H / primary_spec["h"])
+        k = canvas_per_screen(primary_spec)
         crop_x = (CANVAS_W - primary_spec["w"] * k) / 2.0
         crop_y = (CANVAS_H - primary_spec["h"] * k) / 2.0
         try:
@@ -1808,6 +2205,35 @@ def main():
     mouse_cam = load_freefly()
     freefly_dirty = {"v": False, "last": 0.0}
     prev_mouse = None
+    prev_steering = False
+    gyro = {"m": -1.0, "active": False, "xy": (0.0, 0.0, 0.0), "prev": None}
+    persist_last = {"t": 0.0, "dir": None, "saved": None}
+    autozoom = {"m": -1.0, "v": 0.0}
+    cam_target = {"m": -1.0, "t": (0.0, 0.0, 0.0, 0.0), "id": 0.0}
+    autodive = {"m": -1.0, "on": False, "beats": 0.0, "last": None, "id": None}
+
+    def autodive_next():
+        # the same step as `backdrop-dive next`: stop idx+1, or 1 past the last
+        with open(DIVE_PATH_FILE) as fh:
+            stops = [ln.split() for ln in fh if ln.strip()]
+        if not stops:
+            return
+        try:
+            with open(DIVE_IDX_FILE) as fh:
+                idx = int(fh.read().strip() or 0)
+        except (OSError, ValueError):
+            idx = 0
+        nxt = idx + 1 if idx < len(stops) else 1
+        new_id = (int(cam_target["id"]) + 1) % 100000
+        tmp = CAM_TARGET_FILE + ".tmp"
+        with open(tmp, "w") as fh:
+            fh.write(" ".join(stops[nxt - 1][:4]) + f" {new_id}\n")
+        os.replace(tmp, CAM_TARGET_FILE)
+        with open(DIVE_IDX_FILE, "w") as fh:
+            fh.write(f"{nxt}\n")
+        autodive["id"] = float(new_id)
+        bpm = audio_state[0][2].get("u_beat_bpm", 0.0)
+        print(f"autodive: stop {nxt}/{len(stops)} ({bpm:.0f} bpm)", file=sys.stderr)
 
     camera_cache = {"mtime": -1.0, "value": CAMERA_DEFAULT}
 
@@ -1969,15 +2395,21 @@ def main():
             set_uniform("iFrame", frame_counter)
             set_uniform("iResolution", (float(CANVAS_W), float(CANVAS_H), 1.0))
             set_uniform("iSampleRate", AUDIO_SAMPLE_RATE)
-            cur_mouse = read_mouse(last_frame)
+            # 2026-09-27: while the steer key is held, steering means the HAND --
+            # always the real cursor, whatever mouse mode is set. With the audio
+            # mouse (the default) the steer deltas below were the centroid/rms
+            # wobble, so music shook the camera whenever Super was held.
+            super_held = read_steer()
+            steering = super_held > 0.5
+            cur_mouse = read_mouse_real() if steering else read_mouse(last_frame)
             set_uniform("iMouse", cur_mouse)
             cam_elev, cam_yaw, cam_zoom = read_camera()
             set_uniform("u_cam_elev", cam_elev)
             set_uniform("u_cam_yaw", cam_yaw)
             set_uniform("u_cam_zoom", cam_zoom)
-            super_held = read_steer()
             set_uniform("u_steer", super_held)
-            if super_held > 0.5 and prev_mouse is not None:
+            # first steered frame only records the position (prev was the audio mouse)
+            if steering and prev_mouse is not None and prev_steering:
                 mdx = cur_mouse[0] - prev_mouse[0]
                 mdy = cur_mouse[1] - prev_mouse[1]
                 if read_key(ctrl_keycode) > 0.5:
@@ -1990,8 +2422,101 @@ def main():
                     mouse_cam["yaw"]   += mdx * MOUSE_LOOK_SENS
                     mouse_cam["pitch"] += mdy * MOUSE_LOOK_SENS
             prev_mouse = cur_mouse
+            prev_steering = steering
+            # phone gyro (see GYRO_FILE): its per-frame change drags exactly like
+            # a Super + cursor move (look channel)
+            try:
+                g_m = os.path.getmtime(GYRO_FILE)
+                if g_m != gyro["m"]:
+                    gyro["m"] = g_m
+                    with open(GYRO_FILE) as fh:
+                        gv = [float(x) for x in fh.read().split()[:4]]
+                    if len(gv) >= 3:
+                        gyro["active"] = gv[0] > 0.5
+                        gyro["xy"] = (gv[1], gv[2], gv[3] if len(gv) > 3 else 0.0)
+                if time.time() - g_m > GYRO_STALE_S:
+                    gyro["active"] = False
+            except (OSError, ValueError):
+                gyro["active"] = False
+            # a release still applies its final offset (the relay writes the last
+            # one on release), so no motion is lost to a missed sample
+            if gyro["active"] or (gyro["prev"] is not None and time.time() - gyro["m"] <= GYRO_STALE_S):
+                if gyro["prev"] is not None:
+                    mouse_cam["yaw"]   += (gyro["xy"][0] - gyro["prev"][0]) * MOUSE_LOOK_SENS
+                    mouse_cam["pitch"] += (gyro["xy"][1] - gyro["prev"][1]) * MOUSE_LOOK_SENS
+                    # twist about the pointing axis = Super + Ctrl vertical drag
+                    # (nebulabrot: zoom; free-fly shaders: forward/back)
+                    mouse_cam["f"]     += (gyro["xy"][2] - gyro["prev"][2]) * MOUSE_MOVE_SENS
+                gyro["prev"] = gyro["xy"] if gyro["active"] else None
+                super_held = 1.0          # the free-fly pose gets saved like a Super steer
+                set_uniform("u_steer", 1.0)   # shaders gating on it see a steer
+            else:
+                gyro["prev"] = None
             set_uniform("u_cam_look", (mouse_cam["yaw"], mouse_cam["pitch"], mouse_cam["roll"]))
             set_uniform("u_cam_move", (mouse_cam["r"], mouse_cam["u"], mouse_cam["f"]))
+            # Super+Z (i3 -> ~/bin/backdrop-autozoom) flips autozoom.txt: 0/1
+            try:
+                az_m = os.path.getmtime(AUTOZOOM_FILE)
+                if az_m != autozoom["m"]:
+                    autozoom["m"] = az_m
+                    with open(AUTOZOOM_FILE) as fh:
+                        autozoom["v"] = 1.0 if fh.read().strip() == "1" else 0.0
+            except (OSError, ValueError):
+                autozoom["v"] = 0.0
+            set_uniform("u_autozoom", autozoom["v"])
+            # dive path (~/bin/backdrop-dive -> cam_target.txt:
+            # "re im zoom rot id"); the shader flies to it when the id changes
+            try:
+                ct_m = os.path.getmtime(CAM_TARGET_FILE)
+                if ct_m != cam_target["m"]:
+                    cam_target["m"] = ct_m
+                    with open(CAM_TARGET_FILE) as fh:
+                        v = [float(x) for x in fh.read().split()[:5]]
+                    if len(v) == 5:
+                        cam_target["t"], cam_target["id"] = tuple(v[:4]), v[4]
+                        print(f"cam target: {cam_target['t']} id {cam_target['id']:.0f}", file=sys.stderr)
+            except (OSError, ValueError):
+                pass
+            set_uniform("u_cam_target", cam_target["t"])
+            set_uniform("u_cam_target_id", cam_target["id"])
+            # auto-dive (Super+Up): counted on the beat clock, like the flights
+            try:
+                ad_m = os.path.getmtime(AUTODIVE_FILE)
+                if ad_m != autodive["m"]:
+                    autodive["m"] = ad_m
+                    with open(AUTODIVE_FILE) as fh:
+                        on = fh.read().strip() == "1"
+                    if on and not autodive["on"]:
+                        autodive["beats"] = AUTODIVE_BEATS      # first jump right away
+                        autodive["last"], autodive["id"] = None, cam_target["id"]
+                    autodive["on"] = on
+            except OSError:
+                autodive["on"] = False
+            if autodive["on"]:
+                bc = audio_state[0][2].get("u_beat_count")
+                if bc is not None:
+                    if autodive["last"] is not None:
+                        # forward steps only: the clock can tick back a hair
+                        # (phase correction / cached-grid lock), and wrapped
+                        # that reads as ~1024 beats -- which fired every frame
+                        d = (bc - autodive["last"]) % 1024.0
+                        autodive["beats"] += d if d < 4.0 else 0.0
+                    autodive["last"] = bc
+                if cam_target["id"] != autodive["id"]:          # a manual jump
+                    autodive["beats"], autodive["id"] = 0.0, cam_target["id"]
+                if autodive["beats"] >= AUTODIVE_BEATS:
+                    autodive["beats"] = 0.0
+                    try:
+                        autodive_next()
+                    except OSError as e:
+                        print(f"autodive: {e}", file=sys.stderr)
+            if mp is not None and mp["manifest"].get("persist"):
+                if persist_last.get("dir") != mp["dir"]:
+                    persist_last["dir"] = mp["dir"]
+                    persist_last["saved"] = load_persist(mp)
+                saved = persist_last["saved"]
+                set_uniform("u_persist0", saved if saved else (0.0, 0.0, 0.0, 0.0))
+                set_uniform("u_persist_valid", 1.0 if saved else 0.0)
             # Persist the free-fly pose, throttled: it only changes while the
             # steer key is held, and one write per second is plenty to survive a
             # restart or be read back and frozen into the shader.
@@ -2150,7 +2675,17 @@ def main():
             # way.
             render_start = time.monotonic()
             if mp is not None:
+                if mp.get("compute") is not None:
+                    mp["compute"].step(dt, elapsed)
                 render_multipass(ctx, mp, canvas_fbo, audio_channel_tex)
+                if mp["manifest"].get("persist") and elapsed - persist_last["t"] > PERSIST_SECONDS:
+                    persist_last["t"] = elapsed
+                    try:
+                        v = save_persist(mp)
+                        if v:
+                            persist_last["saved"] = v    # a hot reload restores the LATEST view
+                    except Exception as e:
+                        print(f"persist: save failed: {e}", file=sys.stderr)
             else:
                 canvas_fbo.use()
                 ctx.clear(0.0, 0.0, 0.0, 1.0)
@@ -2186,6 +2721,8 @@ def main():
                 p["prog"]["src_tex"].value = 0
                 p["prog"]["uv_offset"].value = p["uv_offset"]
                 p["prog"]["uv_scale"].value = p["uv_scale"]
+                p["prog"]["tap"].value = (0.25 * p["uv_scale"][0] / p["spec"]["w"],
+                                          0.25 * p["uv_scale"][1] / p["spec"]["h"])
                 p["ctx"].clear(0.0, 0.0, 0.0, 1.0)
                 p["vao"].render(moderngl.TRIANGLE_STRIP)
                 glfw.swap_buffers(p["window"])

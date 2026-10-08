@@ -1,0 +1,12 @@
+{
+  "_doc": "Swappable scene for illusion_diamond (scope.md 2026-10-04): what hides inside the stone and what is behind it. Edit, then rerun: ~/onetrainer-gpu/.venv/bin/python tools/diamond_design.py shaders/illusion_diamond.mp",
+  "backdrop": "textures/illusion_diamond/backdrops/bd6.png",
+  "walls": {"_doc": "vertical internal cracks from the centre line (object y axis) outwards, at these angles (deg, in the xz plane); seen from the top they split the stone into chambers", "radial_deg": [90, 210, 330]},
+  "objects": [
+    {"name": "red_dwarf",   "type": "star", "color": [1.00, 0.28, 0.08], "chamber_deg": 30,  "r": 0.32, "y":  0.05, "radius": 0.009,
+     "mirror": {"_doc": "concave focus mirror between the star and the centre, star at its focus (cheat #1: a true mirror)", "vertex_r": 0.20, "half_deg": 30}},
+    {"name": "white_dwarf", "type": "star", "color": [0.80, 0.88, 1.00], "chamber_deg": 150, "r": 0.32, "y": -0.05, "radius": 0.009,
+     "mirror": {"vertex_r": 0.20, "half_deg": 30}}
+  ],
+  "stone": {"facets": 72, "tilt_deg": 38.0, "pattern": "alternate", "ior": "diamond", "seed": 1}
+}

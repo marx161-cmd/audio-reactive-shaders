@@ -358,11 +358,41 @@ def load_static_data_texture(ctx, path, filter_mode=None):
     load_static_array_texture -- because several shaders ship multi-layer
     baked path/volume tables that must be sampled with texture(sampler2DArray,
     vec3). filter_mode comes from the manifest's static_texture_filters."""
+    # 2026-10-08: a static texture may be a plain image file (the stained-glass
+    # diamonds' backdrops), as in shader-backdrop's live renderer since
+    # 2026-10-04: decoded with PIL, same GL row-flip and filters as there.
+    if not path.lower().endswith(".npy"):
+        from PIL import Image
+        img = Image.open(path)
+        if "A" in img.getbands():
+            arr = np.asarray(img.convert("RGBA"))
+        elif img.mode in ("L", "1", "I", "F"):
+            arr = np.asarray(img.convert("L"))
+        else:
+            arr = np.asarray(img.convert("RGB"))
+        arr = np.ascontiguousarray(arr[::-1])   # GL texture origin is bottom-left
+        h, w = arr.shape[:2]
+        tex = ctx.texture((w, h), 1 if arr.ndim == 2 else arr.shape[2], arr.tobytes())
+        if filter_mode == "nearest":
+            tex.filter = (moderngl.NEAREST, moderngl.NEAREST)
+        elif filter_mode == "linear_mip":
+            tex.build_mipmaps()
+            tex.filter = (moderngl.LINEAR_MIPMAP_LINEAR, moderngl.LINEAR_MIPMAP_LINEAR)
+        else:
+            tex.filter = (moderngl.LINEAR, moderngl.LINEAR)
+        tex.repeat_x = filter_mode == "linear_wrap"
+        tex.repeat_y = False
+        return tex
     head = np.load(path, mmap_mode="r")
     if head.ndim == 4:
         return load_static_array_texture(ctx, path, head, filter_mode)
     del head
-    arr = np.load(path)
+    # 2026-10-08: big 2D textures (the Nebulabrot's 2 GB layers) go up in 64 MB row
+    # slabs from the memmap with a finish() after each, exactly like shader-backdrop's
+    # live renderer (2026-09-27/28): a one-shot upload fails in radeonsi ("failed to
+    # create temporary texture to hold untiled copy") and the frames render black.
+    big = os.path.getsize(path) > (256 << 20)
+    arr = np.load(path, mmap_mode="r") if big else np.load(path)
     if arr.ndim == 2:
         h, w = arr.shape
         comps = 1
@@ -370,8 +400,17 @@ def load_static_data_texture(ctx, path, filter_mode=None):
         h, w, comps = arr.shape
     else:
         raise ValueError(f"{path}: expected (H,W) or (H,W,C<=4), got {arr.shape}")
-    arr = np.ascontiguousarray(arr)
-    if arr.dtype == np.uint8:
+    if big:
+        dt = {np.uint8: "f1", np.float32: "f4", np.float16: "f2"}.get(arr.dtype.type)
+        if dt is None:
+            raise ValueError(f"{path}: unsupported dtype {arr.dtype}")
+        tex = ctx.texture((w, h), comps, dtype=dt)
+        rows = max(1, (64 << 20) // (w * comps * arr.itemsize))
+        for y0 in range(0, h, rows):
+            y1 = min(h, y0 + rows)
+            tex.write(np.ascontiguousarray(arr[y0:y1]).tobytes(), viewport=(0, y0, w, y1 - y0))
+            ctx.finish()
+    elif (arr := np.ascontiguousarray(arr)).dtype == np.uint8:
         tex = ctx.texture((w, h), comps, arr.tobytes())
     elif arr.dtype == np.float32:
         tex = ctx.texture((w, h), comps, arr.tobytes(), dtype="f4")

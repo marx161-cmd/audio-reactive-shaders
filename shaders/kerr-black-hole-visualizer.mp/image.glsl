@@ -1,9 +1,10 @@
 // Kerr-Black-Hole-Visualizer: image pass.
 //
-// Per pixel: walk the precomputed Kerr-Newman light path, test it against the
-// accretion disk and every body (culled system -> star family -> planet ->
-// moons), then shade the sky where the path escapes. Body positions come from
-// Buffer A.
+// Per pixel: walk the precomputed Kerr-Newman light path, test it against every
+// body (culled system -> star family -> planet -> moons) and march the flare
+// disk along it, then shade the sky where the path escapes. Body positions come
+// from Buffer A. The pulsar's beams turn like a wheel seen edge-on (a vertical
+// line on screen), two turns per beat.
 
 float sSlot(int px)       { return texelFetch(iChannel0, ivec2(px, 0), 0).r; }
 float macroBand(int px)   { return sSlot(px); }
@@ -111,11 +112,23 @@ void sceneCopy(int kCopy, vec3 ro, vec3 rd, float row, vec3 er, vec3 et,
 
     vec3  prev = geoPoint(row, 0, er, et);
     float arc  = 0.0;
+    bool  dHadGas = false;
+    float dPassTr = 1.0;
 
     if (diskOwner) {
         dPrevD = dot(prev, dn);
         dPrevM = dot(prev, mn);
     }
+    vec4  knAcc   = vec4(0.0);
+    float knPhase = fract(sin(dot(vec2(gPix), vec2(12.9898, 78.233))) * 43758.5453);
+    float knShell = 0.0;
+    float knLam   = (KN_DISK == 1 && diskOwner) ? kerrW(0) : 0.0;
+    vec3  knE1    = normalize(cross(dn, vec3(0.0, 0.0, 1.0)));
+    vec3  knE2    = cross(dn, knE1);
+    vec3  knPrevQ = vec3(dot(prev, knE1), dot(prev, dn), dot(prev, knE2)) / BH_RS;
+    float knPrevR = knKSRadius(dot(knPrevQ.xz, knPrevQ.xz), knPrevQ.y * knPrevQ.y);
+    vec3  knSrc   = (gKNStar == 0) ? bPulsar.xyz : bDwarf.xyz;
+    float knPhD   = atan(dot(knSrc, knE2), dot(knSrc, knE1));
 
     float glareD2P = 1e30;
     float glareD2D = 1e30;
@@ -135,27 +148,73 @@ void sceneCopy(int kCopy, vec3 ro, vec3 rd, float row, vec3 er, vec3 et,
             float dCurD = dot(cur, dn);
             float dCurM = dot(cur, mn);
             vec3  sdir = (cur - prev) / max(seg, 1e-6);
-            if (DISK_SHOW == 1 && dPrevD * dCurD < 0.0) {
-                float fx = dPrevD / (dPrevD - dCurD);
-                vec3  X  = mix(prev, cur, fx);
-                {
-                    vec3 scrR = normalize(cross(-normalize(ro), dn));
-                    X -= normalize(scrR - dot(scrR, dn) * dn) * (DISK_SHIFT * BH_RS);
+            if (KN_DISK == 1) {
+                vec3  qC = vec3(dot(cur, knE1), dot(cur, dn), dot(cur, knE2)) / BH_RS;
+                float rC = knKSRadius(dot(qC.xz, qC.xz), qC.y * qC.y);
+                knShell += knShellStep(knPrevQ, qC, knPrevR, rC);
+                if (gKNOn) knDiskChord(knPrevQ, qC, arc / BH_RS, knLam, knShell, knPhD, knAcc, knPhase);
+                knPrevQ = qC; knPrevR = rC;
+            }
+            bool dSegGas = false;
+            if (DISK_SHOW == 1 && gDiskEdge > DISK_R_IN_VIS) {
+                float rA_ = length(prev) / BH_RS, rC_ = length(cur) / BH_RS;
+                float hB = min(DISK_H_CAP * max(diskHR0(rA_), diskHR0(rC_)), DISK_HR_MAX) * DISK_H_SCALE;
+                float zB = DISK_ZMAX * hB * max(rA_, rC_) * BH_RS;
+                float dz = dCurD - dPrevD;
+                float t0 = 0.0, t1 = 1.0;
+                if (abs(dz) > 1e-9) {
+                    float ta = (-zB - dPrevD) / dz, tb = (zB - dPrevD) / dz;
+                    t0 = max(0.0, min(ta, tb)); t1 = min(1.0, max(ta, tb));
+                } else if (abs(dPrevD) >= zB) {
+                    t1 = -1.0;
                 }
-                float rW = length(X) / BH_RS, aW = KERR_A * 0.5;
-                float rB = sqrt(max(rW * rW - aW * aW, 0.0));
-                if (rB >= DSIM_RIN && rB <= DSIM_ROUT) {
-                    vec3  e1 = normalize(cross(dn, vec3(0.0, 0.0, 1.0)));
-                    vec3  e2 = cross(dn, e1);
-                    float phB  = atan(dot(X, e2), dot(X, e1));
-                    float cosI = abs(dot(sdir, dn));
-                    float colS = 2.50663 * DISK_HR * rB / max(cosI, 0.05);
-                    float phUse = (DISK_UNDER_FLIP == 1 && dPrevD < 0.0) ? -phB : phB;
-                    vec4  sh = diskShareShade(rB, phUse, colS, kerrW(0), bass);
-                    emitD  += sh.rgb * DISK_GLOW * diskTr;
-                    diskTr *= mix(1.0, sh.a, DISK_COVER);
+                {
+                    vec3  dv = cur - prev;
+                    float Ro = 1.02 * sqrt(gDiskEdge * gDiskEdge + 0.25 * KERR_A * KERR_A) * BH_RS;
+                    float A_ = dot(dv, dv), B_ = dot(prev, dv), C_ = dot(prev, prev) - Ro * Ro;
+                    float disc = B_ * B_ - A_ * C_;
+                    if (disc <= 0.0 || A_ < 1e-12) { if (C_ > 0.0) t1 = -1.0; }
+                    else {
+                        float sq = sqrt(disc);
+                        t0 = max(t0, (-B_ - sq) / A_); t1 = min(t1, (-B_ + sq) / A_);
+                    }
+                }
+                if (t1 > t0) {
+                    float aW  = KERR_A * 0.5;
+                    vec3  e1  = normalize(cross(dn, vec3(0.0, 0.0, 1.0)));
+                    vec3  e2  = cross(dn, e1);
+                    float Ltot = seg * (t1 - t0) / BH_RS;
+                    float rMid = length(mix(prev, cur, 0.5 * (t0 + t1))) / BH_RS;
+                    int   nP   = int(clamp(ceil(Ltot / max(0.35 * rMid, 1e-3)), 1.0, float(DISK_VOL_N)));
+                    bool  under = (DISK_UNDER_FLIP == 1 && dCurD > dPrevD);
+                    for (int k = 0; k < DISK_VOL_N; k++) {
+                        if (k >= nP) break;
+                        float ta = t0 + (t1 - t0) * float(k)     / float(nP);
+                        float tb = t0 + (t1 - t0) * float(k + 1) / float(nP);
+                        vec3  X  = mix(prev, cur, 0.5 * (ta + tb));
+                        float zW = dot(X, dn);
+                        float rW = length(X - zW * dn) / BH_RS;
+                        float rB = sqrt(max(rW * rW - aW * aW, 0.0));
+                        if (rB < max(DSIM_RIN, DISK_R_IN_VIS) || rB > min(DSIM_ROUT, gDiskEdge)) continue;
+                        float phB = atan(dot(X, e2), dot(X, e1));
+                        float phUse = under ? -phB : phB;
+                        float wrapM = flareWrap(phB + FLARE_FRONT_RAG * knPerlin(vec3(1.3 * rB, 0.5 * zW / BH_RS, 2.0 * gFlareDt)),
+                                                atan(dot(bDwarf.xyz, e2), dot(bDwarf.xyz, e1)));
+                        if (wrapM <= 0.0) continue;
+                        float H   = diskLiveCH(rB, phUse).y;
+                        float za  = (dPrevD + dz * ta) / BH_RS, zb = (dPrevD + dz * tb) / BH_RS;
+                        float col = gaussColumn(za, zb, Ltot / float(nP), H) * wrapM;
+                        if (col < 1e-5 * H) continue;
+                        vec4  sh  = diskVolShade(rB, phUse, 0.5 * (za + zb), col, kerrW(0), bass);
+                        emitD  += sh.rgb * DISK_GLOW * diskTr * dPassTr;
+                        dPassTr *= sh.a;
+                        diskTr *= mix(1.0, sh.a, DISK_COVER);
+                        dSegGas = true;
+                    }
                 }
             }
+            if (occLimit < 1e4 && dHadGas && !dSegGas) diskTr = 0.0;
+            dHadGas = dHadGas || dSegGas;
             if (metLive) {
                 if (dPrevM * dCurM < 0.0) {
                     float f = dPrevM / (dPrevM - dCurM);
@@ -198,7 +257,7 @@ void sceneCopy(int kCopy, vec3 ro, vec3 rd, float row, vec3 er, vec3 et,
 
         if (geoSegSphere(prev, cur, bPulsar.xyz, bPulsar.w, th, hp)) {
             if (th < bestF) { bestF = th; bestId = 1.0; bestB = bPulsar; bestP = hp; } }
-        if (geoSegSphere(prev, cur, bDwarf.xyz, bDwarf.w, th, hp)) {
+        if (geoSegDrop(prev, cur, bDwarf.xyz, bDwarf.w, dropK(bDwarf.xyz), th, hp)) {
             if (th < bestF) { bestF = th; bestId = 2.0; bestB = bDwarf; bestP = hp; } }
         if (geoSegSphere(prev, cur, bPG.xyz, bPG.w, th, hp)) {
             if (th < bestF) { bestF = th; bestId = 3.0; bestB = bPG; bestP = hp; } }
@@ -277,7 +336,8 @@ void sceneCopy(int kCopy, vec3 ro, vec3 rd, float row, vec3 er, vec3 et,
         if (hitId == 1.0) {
             col = neutronStarSurface(hitP - hitC, hitV, hitR, bass, iTime);
         } else if (hitId == 2.0) {
-            col = redDwarfSurface(hitP - hitC, hitV, hitR, mid, iTime, copyDwarfTint(kCopy));
+            vec3 dn = dropNormal(hitP, hitC, hitR, dropK(hitC));
+            col = redDwarfSurface(dn * hitR, hitV, hitR, mid, iTime, copyDwarfTint(kCopy));
         } else {
             vec3 albT; float isGiant = 0.0;
             vec3 gu, gv, gn;
@@ -348,7 +408,7 @@ void sceneCopy(int kCopy, vec3 ro, vec3 rd, float row, vec3 er, vec3 et,
     tLeft = min(tLeft, max(minT - pNearArc, 0.0));
 
     glow += hueRotate(calcPulsarJets(pNearPos, pNearDir, bPulsar.xyz,
-                                     copyRot(getPulsarAxis(), kCopy),
+                                     (PULSAR_SPIN_HOLE == 1 ? getPulsarAxisAt(bPulsar.xyz) : copyRot(getPulsarAxis(), kCopy)),
                                      bass, treble, tLeft, iTime),
                       copyCoronaShift(kCopy));
 
@@ -383,7 +443,7 @@ void sceneCopy(int kCopy, vec3 ro, vec3 rd, float row, vec3 er, vec3 et,
     }
 
     {
-        vec3 mAxis = copyRot(getPulsarAxis(), kCopy);
+        vec3 mAxis = (PULSAR_SPIN_HOLE == 1 ? getPulsarAxisAt(bPulsar.xyz) : copyRot(getPulsarAxis(), kCopy));
         float tLeftH = (occLimit < 1e4) ? max(arc - pHaloArc, 0.0) : 1e5;
         tLeftH = min(tLeftH, max(minT - pHaloArc, 0.0));
         vec2 hb = intersectSphere(pHaloPos - bPulsar.xyz, pNearDir, HALO_BOUND);
@@ -421,6 +481,10 @@ void sceneCopy(int kCopy, vec3 ro, vec3 rd, float row, vec3 er, vec3 et,
     }
 
     if (diskOwner) {
+        if (KN_DISK == 1) {
+            gKNEmit = knToneMap(knAcc) * KN_GAIN;
+            gKNTr   = pow(vec3(1.0 - knAcc.a), vec3(1.0, 1.6, 2.5));
+        }
         diskEmitOut = emitD;
         gDiskTr = diskTr;
         metHeadD2Out = headD2; metLiveOut = metLive;
@@ -436,17 +500,69 @@ void sceneCopy(int kCopy, vec3 ro, vec3 rd, float row, vec3 er, vec3 et,
 }
 
 uniform sampler2DArray u_knsky;
+#define SKY_DEBUG 0
 vec3 knSky(vec3 rdL, float treble, float skyB) {
     vec3 c = vec3(0.0);
+    float wsum = 0.0;
+    if (SKY_DEBUG == 1) {
+        vec4 best = vec4(0.0);
+        for (int k = 0; k < 4; k++) {
+            vec4 d = texelFetch(u_knsky, ivec3(gPix, k), 0);
+            if (d.w > best.w) best = d;
+        }
+        gFootScale = 1.0;
+        float wt = texelFetch(u_knsky, ivec3(gPix, 0), 0).w + texelFetch(u_knsky, ivec3(gPix, 1), 0).w
+                 + texelFetch(u_knsky, ivec3(gPix, 2), 0).w + texelFetch(u_knsky, ivec3(gPix, 3), 0).w;
+        return (best.w > 0.0) ? min(wt, 1.0) * skyColorDispersed(rdL, normalize(best.xyz) - rdL, treble, skyB) : c;
+    }
     for (int k = 0; k < 4; k++) {
         vec4 d = texelFetch(u_knsky, ivec3(gPix, k), 0);
-        if (d.w > 0.0) c += d.w * skyColorDispersed(rdL, normalize(d.xyz) - rdL, treble, skyB);
+        gFootScale = (SKY_CLUSTER_FOOT == 1) ? sqrt(clamp(d.w, 0.0, 1.0)) : 1.0;
+        if (d.w > 0.0) {
+            vec3 sc = skyColorDispersed(rdL, normalize(d.xyz) - rdL, treble, skyB);
+            if (SKY_PROCEDURAL == 1) { c = max(c, sc); wsum += d.w; }
+            else c += d.w * sc;
+        }
     }
+    if (SKY_PROCEDURAL == 1) c *= min(wsum, 1.0);
+    gFootScale = 1.0;
     return c;
+}
+
+uniform sampler2DArray u_slurp_dwarf;
+#define SLURP_ORIGIN   vec2(494.0, 436.0)
+#define SLURP_SIZE     1536.0
+#define SLURP_FRAMES   72
+#define SLURP_BEAT0    (-0.166667)
+#define SLURP_BSTEP    (0.028169014)
+#define SLURP_DWARF_GAIN   1.5
+#define SLURP_DWARF_COVER  0.6
+const float SLURP_DWARF_PERI[6] = float[6](25.30, 41.36, 57.41, 73.47, 89.52, 105.58);
+
+vec3 slurpComposite(vec3 col, sampler2DArray flip, const float peri[6], float gain, float cover) {
+    vec2 uv = (vec2(gPix) - SLURP_ORIGIN + 1.0) / SLURP_SIZE;
+    if (any(lessThan(uv, vec2(0.0))) || any(greaterThan(uv, vec2(1.0)))) return col;
+    float cm = mod(tempoBeatCount(), 128.0);
+    #define SLURP_FORCE_FRAME -1
+    if (SLURP_FORCE_FRAME >= 0) cm = peri[0] + SLURP_BEAT0 + float(SLURP_FORCE_FRAME) * SLURP_BSTEP;
+    #define SLURP_PREVIEW_FPS 0.0
+    if (SLURP_PREVIEW_FPS > 0.0) cm = peri[0] + SLURP_BEAT0 + mod(iTime * SLURP_PREVIEW_FPS, float(SLURP_FRAMES - 1)) * SLURP_BSTEP;
+    for (int k = 0; k < 6; k++) {
+        float f = (cm - peri[k] - SLURP_BEAT0) / SLURP_BSTEP;
+        if (f < 0.0 || f > float(SLURP_FRAMES - 1)) continue;
+        float f0 = floor(f);
+        vec4 a = texture(flip, vec3(uv, f0));
+        vec4 b = texture(flip, vec3(uv, min(f0 + 1.0, float(SLURP_FRAMES - 1))));
+        vec4 s = mix(a, b, f - f0);
+        return col * (1.0 - cover * clamp(s.a, 0.0, 1.0)) + s.rgb * gain;
+    }
+    return col;
 }
 
 void mainImage(out vec4 fragColor, in vec2 fragCoord) {
     gPix = ivec2(fragCoord);
+    gDiskEdge = flareEdge();
+    knLifeFrame();
     vec2 uv = (-iResolution.xy + 2.0 * fragCoord.xy) / iResolution.y;
 
     float bass   = macroBand(13);
@@ -492,6 +608,7 @@ void mainImage(out vec4 fragColor, in vec2 fragCoord) {
 
     gHoleDir = normalize(-roL);
     gCamR = camR3; gCamU = camU;
+    gSheetDir = normalize(skyRotate(gHoleDir));
     gBass    = bass;
     gPondR   = length(uv);
     vec3  gEr, gEt;
@@ -513,9 +630,10 @@ void mainImage(out vec4 fragColor, in vec2 fragCoord) {
     float skyB    = (geoB >= 0.0) ? geoB * BH_RS  : 1e5;
 
     vec3 nebAdd = capt ? vec3(0.0) : nebulaAt(gExit, bass);
+    float nebExt = capt ? 0.0 : nebulaExt(gExit);
 
     if (intersectSphere(roL, rdL, SPHERE_RADIUS).y <= 0.0) {
-        vec3 bg = knSky(rdL, treble, skyB);
+        vec3 bg = knSky(rdL, treble, skyB) * (1.0 - nebExt);
         bg += nebAdd;
         fragColor = vec4(globalGrade(bg / (1.0 + bg * 0.32)), 1.0);
         return;
@@ -533,6 +651,7 @@ void mainImage(out vec4 fragColor, in vec2 fragCoord) {
     float metHeat   = 0.0, metDoom = 0.0;
 
     gDiskTr = 1.0;
+    gKNEmit = vec3(0.0); gKNTr = vec3(1.0);
     for (int k = 0; k < N_COPIES; k++) {
         vec4  cs; float cd; vec3 cg;
         vec3  dkEmit; float dkHead; bool dkLive; float dkHeat, dkDoom;
@@ -547,13 +666,18 @@ void mainImage(out vec4 fragColor, in vec2 fragCoord) {
         }
     }
 
-    vec3 col = knSky(rdL, treble, skyB);
+    vec3 col = knSky(rdL, treble, skyB) * (1.0 - nebExt);
     col += nebAdd;
     col = mix(col, bestSolid.rgb, clamp(bestSolid.a, 0.0, 1.0));
     col *= gDiskTr;
+    col *= gKNTr;
     col += glowSum;
+    col += gKNEmit;
 
     col += diskToneSum(diskEmit);
+
+    #define SLURP_ON 0
+    if (SLURP_ON == 1) col = slurpComposite(col, u_slurp_dwarf, SLURP_DWARF_PERI, SLURP_DWARF_GAIN, SLURP_DWARF_COVER);
 
     if (geoB >= 0.0 && GEO_KERR == 0) {
         float caustic = exp(-pow((geoB - GEO_B_CRIT) / PRING_THICK, 2.0));

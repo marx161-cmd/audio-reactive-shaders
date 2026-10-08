@@ -1,9 +1,16 @@
 // Kerr-Black-Hole-Visualizer: common code, prepended to every pass.
 //
 // Constants, uniforms and shared functions: beat clock, orbital mechanics
-// (Kepler orbits, gear phases), star/sky sampling (BC6H cube map), body
-// surfaces, accretion disk emission and the Kerr-Newman geodesic walk
-// (precomputed light paths in u_kerrpaths, walked as a polyline).
+// (beat-locked Kepler orbits, the horseshoe swap), star/sky sampling (Gaia DR3
+// point stars as a BC6H cube map, photo nebula), body surfaces and the
+// Kerr-Newman geodesic walk (precomputed light paths in u_kerrpaths, walked as
+// a polyline).
+// KN_DISK: the accretion disk is the volumetric disk of the NPGS Kerr-Newman
+// renderer (github.com/baopinshui/NPGS, GPL-3.0, its DiskColor), marched on
+// the precomputed paths. It only exists around a star's close pass: it winds
+// out of the star's side, is full at periapsis and is eaten outside-in as the
+// star leaves. Both stars feed it (the red dwarf's disk weaker and warmer); at
+// the swap, when both pass within a few beats, they feed one disk.
 // Audio arrives in the `bands` texture: 120 semitone bands, 0..1.
 
 const float PI  = 3.141592653589793;
@@ -18,14 +25,16 @@ uniform sampler2D u_rockmap;
 uniform sampler2D u_ringprof;
 uniform sampler2D u_stars;
 uniform sampler2D u_cells;
+uniform sampler2D u_disklive;
+uniform float u_disk_x0, u_disk_dx, u_disk_dphi, u_disk_rin, u_disk_rout;
 uniform samplerCube u_skycube;
 uniform sampler2D u_nebula;
-#define NEB_W       4096.0
-#define NEB_GAIN    15.0
-#define NEB_SAT     1.35
+#define NEB_W       16383.0
+#define NEB_GAIN    1.0
+#define NEB_SAT     1.0
 #define NEB_FLOOR   0.0
-#define NEB_TINT    vec3(1.00, 0.90, 0.78)
-#define NEB_BASS_DRIVE 1.8
+#define NEB_TINT    vec3(1.0, 1.0, 1.0)
+#define NEB_BASS_DRIVE 0.3
 
 uniform float u_cam_elev;
 uniform float u_cam_yaw;
@@ -321,13 +330,15 @@ float lapHue(float beatsPer, float phaseOffset, float offset) {
 #define RING_DENS_K2  1.30
 
 #define SKY_GAIN      3.20
-#define SKY_AUDIO     0.12
+#define SKY_AUDIO     0.0
 #define SKY_DRIFT     0.0
 #define SKY_ROT_SENS  0.0
 #define SKY_PITCH     1.267
 #define SKY_YAW       0.60
 #define SKY_YAW_SENS  0.10
 #define SKY_ROLL_SENS 0.10
+#define SKY_START_X    -194.749266
+#define SKY_START_Z    -620.453492
 #define SKY_DRAG_R0    116.348319
 #define SKY_DRAG_F0    -15.872584
 #define SKY_DRAG_SENS  0.10
@@ -482,22 +493,23 @@ float gPondM  = 0.0;
 #define PULSE_AMP     0.030
 vec2 gPulse[PULSE_N];
 
-#define SHEET_DEPTH  0.25
+#define SHEET_DEPTH  0.0
 #define SHEET_W      0.50
 vec3  gHoleDir = vec3(0.0, 0.0, 1.0);
+vec3  gSheetDir = vec3(0.0, 0.0, 1.0);
 vec3  gCamR = vec3(1.0, 0.0, 0.0);
 vec3  gCamU = vec3(0.0, 1.0, 0.0);
 
 vec3 skyWarp(vec3 d) {
     float push = SHEET_DEPTH * clamp(gBass, 0.0, 1.0);
     if (push < 1e-5) return d;
-    float c = clamp(dot(d, gHoleDir), -1.0, 1.0);
-    vec3 perp = d - c * gHoleDir;
+    float c = clamp(dot(d, gSheetDir), -1.0, 1.0);
+    vec3 perp = d - c * gSheetDir;
     float s = length(perp);
     if (s < 1e-5) return d;
     float th = acos(c);
     th += push * th * exp(-(th * th) / (SHEET_W * SHEET_W));
-    return cos(th) * gHoleDir + sin(th) * (perp / s);
+    return cos(th) * gSheetDir + sin(th) * (perp / s);
 }
 
 vec3 starTint(float bv) {
@@ -559,11 +571,21 @@ vec3 starField(vec2 guv, vec2 foot) {
     return s / (1.0 + s * STAR_KNEE);
 }
 
-vec3 skyDirFinal(vec3 dir) {
-    vec3 d = dir;
+uniform float u_rms_accum;
+#define SKY_PARK      1
+#define SKY_WOBBLE_R  0.035
+#define SKY_FLOW_RATE 0.025
+vec3 skyRotate(vec3 dir) {
+    vec3 d;
+    if (SKY_PARK == 1) {
+        float ph = mod(SKY_FLOW_RATE * u_rms_accum / SKY_WOBBLE_R, TAU);
+        d = rotAxis(dir, normalize(cos(ph) * gCamU + sin(ph) * gCamR), SKY_WOBBLE_R);
+    } else {
+        d = rotAxis(dir, gCamU, mod(SKY_FLOW_RATE * u_rms_accum, TAU));
+    }
     {
-        float gx = (u_cam_move.x - SKY_DRAG_R0) * SKY_DRAG_SENS * SKY_DRAG_SX;
-        float gy = (u_cam_move.z - SKY_DRAG_F0) * SKY_DRAG_SENS * SKY_DRAG_SY;
+        float gx = (u_cam_move.x + SKY_START_X - SKY_DRAG_R0) * SKY_DRAG_SENS * SKY_DRAG_SX;
+        float gy = (u_cam_move.z + SKY_START_Z - SKY_DRAG_F0) * SKY_DRAG_SENS * SKY_DRAG_SY;
         d = rotAxis(d, gCamU,  gx);
         d = rotAxis(d, gCamR, -gy);
         float skyPitch = SKY_PITCH + u_cam_move.y * SKY_ROT_SENS;
@@ -583,7 +605,10 @@ vec3 skyDirFinal(vec3 dir) {
         float a = SKY_DRIFT * iTime, ca = cos(a), sa = sin(a);
         d = vec3(d.x * ca - d.z * sa, d.y, d.x * sa + d.z * ca);
     }
-    return skyWarp(d);
+    return d;
+}
+vec3 skyDirFinal(vec3 dir) {
+    return skyWarp(skyRotate(dir));
 }
 vec2 skyDirUV(vec3 dir) {
     vec3 d = skyDirFinal(dir);
@@ -591,7 +616,7 @@ vec2 skyDirUV(vec3 dir) {
                 1.0 - acos(clamp(d.y, -1.0, 1.0)) / PI);
 }
 
-#define NEB_SHOW 0
+#define NEB_SHOW 1
 vec3 nebulaAt(vec3 dir, float bass) {
     if (NEB_SHOW == 0) return vec3(0.0);
     vec2 nuv = skyDirUV(dir);
@@ -601,18 +626,146 @@ vec3 nebulaAt(vec3 dir, float bass) {
     float g = NEB_GAIN * (1.0 + NEB_BASS_DRIVE * clamp(bass, 0.0, 1.0));
     return max(neb - NEB_FLOOR, 0.0) * g;
 }
+#define NEB_DUST 1.0
+float nebulaExt(vec3 dir) {
+    if (NEB_SHOW == 0) return 0.0;
+    vec2 nuv = skyDirUV(dir);
+    return clamp(texture(u_nebula, vec2(wrapU(nuv.x, NEB_W), nuv.y)).a * NEB_DUST, 0.0, 1.0);
+}
 
-#define SKY64_GAIN     2.0
+#define SKY64_GAIN     8.0
 #define SKY64_SHARP    0.5
 #define SKY64_MAXGRAD  0.026
+#define SKY_CLUSTER_FOOT 1
+#define SKY_PROCEDURAL 0
+#define PROC_DENSITY   30.0
+#define PROC_SLOPE     5.0
+#define PROC_GAIN      0.6
+#define PROC_MINRAD    1.6e-4
+vec3 kelvinToRgb(float k);
+uvec3 procPcg(uvec3 v) {
+    v = v * 1664525u + 1013904223u;
+    v.x += v.y * v.z; v.y += v.z * v.x; v.z += v.x * v.y;
+    v ^= v >> 16u;
+    v.x += v.y * v.z; v.y += v.z * v.x; v.z += v.x * v.y;
+    return v;
+}
+vec3 procHash(ivec2 c, int f, int salt) {
+    return vec3(procPcg(uvec3(uint(c.x + 65536), uint(c.y + 65536), uint(f * 131 + salt)))) * (1.0 / 4294967295.0);
+}
+vec3 procFaceDir(int f, vec2 q) {
+    if (f == 0) return vec3( 1.0, q.y, q.x);
+    if (f == 1) return vec3(-1.0, q.y, q.x);
+    if (f == 2) return vec3(q.x,  1.0, q.y);
+    if (f == 3) return vec3(q.x, -1.0, q.y);
+    if (f == 4) return vec3(q.x, q.y,  1.0);
+    return vec3(q.x, q.y, -1.0);
+}
+vec3 procStars(vec3 d, float rad) {
+    vec3 a = abs(d); int f; vec2 q;
+    if (a.x >= a.y && a.x >= a.z) { f = d.x > 0.0 ? 0 : 1; q = vec2(d.z, d.y) / a.x; }
+    else if (a.y >= a.z)          { f = d.y > 0.0 ? 2 : 3; q = vec2(d.x, d.z) / a.y; }
+    else                          { f = d.z > 0.0 ? 4 : 5; q = vec2(d.x, d.y) / a.z; }
+    vec2 e = atan(q) * (4.0 / PI);
+    float n = floor(90.0 * sqrt(PROC_DENSITY));
+    vec2 g = (e * 0.5 + 0.5) * n;
+    ivec2 gi = ivec2(floor(g));
+    float r = max(rad, PROC_MINRAD);
+    vec3 col = vec3(0.0);
+    for (int dy = -1; dy <= 1; dy++)
+    for (int dx = -1; dx <= 1; dx++) {
+        ivec2 cI = gi + ivec2(dx, dy);
+        if (cI.x < 0 || cI.y < 0 || cI.x >= int(n) || cI.y >= int(n)) continue;
+        vec3 h = procHash(cI, f, 7);
+        vec2 se = (vec2(cI) + h.xy) / n * 2.0 - 1.0;
+        vec3 sd = normalize(procFaceDir(f, tan(se * (PI / 4.0))));
+        float dist = length(d - sd);
+        if (dist > r * 1.3) continue;
+        float b = pow(h.z, PROC_SLOPE);
+        vec3 h2 = procHash(cI, f, 11);
+        vec3 tint = kelvinToRgb(mix(3200.0, 11000.0, h2.x * h2.x));
+        col += tint * b * (1.0 - smoothstep(r, r * 1.3, dist));
+    }
+    return col * PROC_GAIN;
+}
+vec3 skyStarRead(vec3 dd, float L, float texel) {
+    if (SKY_PROCEDURAL == 1) return procStars(dd, 0.5 * texel * exp2(L));
+    return textureLod(u_skycube, dd, L).rgb * SKY64_GAIN;
+}
+float gFootScale = 1.0;
+#define SKY_MAXMIP_CUBE 1
 vec3 skyColorG(vec3 dir, float treble, float bImpact, float gscale) {
     vec3 d = skyDirFinal(dir);
-    vec3 gx = dFdx(d) * SKY64_SHARP, gy = dFdy(d) * SKY64_SHARP;
-    float lx = length(gx), ly = length(gy);
-    if (lx > SKY64_MAXGRAD) gx *= SKY64_MAXGRAD / lx;
-    if (ly > SKY64_MAXGRAD) gy *= SKY64_MAXGRAD / ly;
-    vec3 c = textureGrad(u_skycube, d, gx * gscale, gy * gscale).rgb * SKY64_GAIN;
+    vec3 gx = dFdx(d) * (SKY64_SHARP * gFootScale), gy = dFdy(d) * (SKY64_SHARP * gFootScale);
+    float ga = dot(gx, gx), gb = dot(gx, gy), gc = dot(gy, gy);
+    float gtr = 0.5 * (ga + gc);
+    float gMajor = sqrt(gtr + sqrt(max(gtr * gtr - (ga * gc - gb * gb), 0.0)));
+    if (gMajor > SKY64_MAXGRAD) { float k = SKY64_MAXGRAD / gMajor; gx *= k; gy *= k; gMajor = SKY64_MAXGRAD; }
+    #define SKY_LOD0 1
+    #define SKY_LOD_OPEN 2.0
+    #define SKY_LOD_RING 0.5
+    vec3 c;
+    if (SKY_MAXMIP_CUBE == 1 && gscale < 2.0) {
+        float texel = 1.5708 / 16384.0;
+        float Lt = log2(max(gMajor / SKY64_SHARP, 1e-9) / texel);
+        float bE = (bImpact > 1e-4) ? bImpact : 1e5;
+        float prox = 1.0 - smoothstep(BH_CAPTURE * 1.05, BH_CAPTURE * 3.0, bE);
+        float L = clamp(Lt, 0.0, SKY_LOD_OPEN + SKY_LOD_RING * prox);
+        c = skyStarRead(d, L, texel);
+        #define SKY_STREAK_MIX   1.0
+        #define SKY_STREAK_GAIN  2.0
+        #define SKY_STREAK_RATIO 8.0
+        #define SKY_STREAK_TAPS  5
+        if (prox > 0.001 && SKY_STREAK_MIX > 0.0) {
+            vec3 jx = gx / SKY64_SHARP, jy = gy / SKY64_SHARP;
+            float a = dot(jx, jx), b = dot(jx, jy), cc = dot(jy, jy);
+            float tr = 0.5 * (a + cc), dt = sqrt(max(tr * tr - (a * cc - b * b), 0.0));
+            float l1 = tr + dt;
+            vec2 v1 = (abs(b) > 1e-20) ? normalize(vec2(b, l1 - a)) : ((a >= cc) ? vec2(1, 0) : vec2(0, 1));
+            vec3 ax = jx * v1.x + jy * v1.y;
+            float axl = length(ax);
+            if (axl > 1e-12) {
+                ax /= axl;
+                float half_ = 0.5 * min(sqrt(l1), texel * exp2(L) * SKY_STREAK_RATIO);
+                vec3 acc = vec3(0.0); float wt = 0.0;
+                for (int i = -SKY_STREAK_TAPS; i <= SKY_STREAK_TAPS; i++) {
+                    float f = float(i) / float(SKY_STREAK_TAPS);
+                    float w = exp(-2.5 * f * f);
+                    acc += w * skyStarRead(normalize(d + ax * (f * half_)), L, texel);
+                    wt  += w;
+                }
+                vec3 cs = acc / wt * SKY_STREAK_GAIN;
+                c = mix(c, cs, smoothstep(0.05, 0.9, prox) * SKY_STREAK_MIX);
+            }
+        }
+        #define PROC_GLOW_POW  0.35
+        #define PROC_GLOW_GAIN 1.0
+        if (SKY_PROCEDURAL == 1) {
+            vec3 fx = gx / SKY64_SHARP, fy = gy / SKY64_SHARP;
+            float lam = PROC_DENSITY * 3282.8 * length(cross(fx, fy));
+            float tg = smoothstep(0.5, 2.0, lam);
+            if (tg > 0.0) {
+                vec3 glow = vec3(1.0, 0.93, 0.85) * PROC_GAIN / (PROC_SLOPE + 1.0)
+                          * pow(max(lam, 1e-6), PROC_GLOW_POW) * PROC_GLOW_GAIN;
+                c = mix(c, glow, tg);
+            }
+        }
+    } else {
+        c = (SKY_LOD0 == 1 && gscale < 2.0) ? textureLod(u_skycube, d, 0.0).rgb * SKY64_GAIN
+                                            : textureGrad(u_skycube, d, gx * gscale, gy * gscale).rgb * SKY64_GAIN;
+    }
+    #define SKY_STAR_GCUT 11.0
+    if (SKY_PROCEDURAL == 0) {
+        float pk  = max(c.r, max(c.g, c.b)) / SKY64_GAIN;
+        float thr = 0.5 * 0.13 * pow(10.0, 0.148 * (11.7 - SKY_STAR_GCUT));
+        c *= smoothstep(thr * 0.5, thr * 1.5, pk);
+    }
     c *= (SKY_GAIN + SKY_AUDIO * treble);
+    #define SKY_MARK 0
+    if (SKY_MARK == 2) {
+        float th = acos(clamp(dot(normalize(d), gSheetDir), -1.0, 1.0));
+        if (th < SHEET_W * 0.7071) c += vec3(0.5, 0.0, 0.0);
+    }
 
     float bEff = (bImpact > 1e-4) ? bImpact : 1e5;
     float lensStress = smoothstep(BH_CAPTURE * 1.05, BH_CAPTURE * 2.5, bEff);
@@ -665,17 +818,24 @@ vec3 skyColorDispersed(vec3 rd, vec3 bend, float treble, float bImpact) {
     if (disp < 1e-4 && ca < 1e-4) {
         return skyColor(dG, treble, bEff);
     }
-    vec3 acc = vec3(0.0), wsum = vec3(0.0);
-    vec3 glow = skyColorG(dG, treble, bEff, GLOW_BLUR);
+    vec3 acc = vec3(0.0), wsum = vec3(0.0), wmax = vec3(0.0);
+    #define SKY_MAXMIP 1
+    vec3 glow = (SKY_MAXMIP == 1) ? vec3(0.0) : skyColorG(dG, treble, bEff, GLOW_BLUR);
     for (int k = 0; k < SPLIT_N; k++) {
         float t = 1.0 - 2.0 * float(k) / float(SPLIT_N - 1);
         vec3 w = vec3(exp(-pow((t - 0.75) / SPLIT_SIGMA, 2.0)),
                       exp(-pow( t          / SPLIT_SIGMA, 2.0)),
                       exp(-pow((t + 0.75) / SPLIT_SIGMA, 2.0)));
         vec3 dk = skyRadial(normalize(rd + bend * (1.0 + t * disp)), t * ca);
-        acc  += w * (skyColorG(dk, treble, bEff, 1.0) - skyColorG(dk, treble, bEff, GLOW_BLUR));
+        acc  += w * (skyColorG(dk, treble, bEff, 1.0) - ((SKY_MAXMIP == 1) ? vec3(0.0) : skyColorG(dk, treble, bEff, GLOW_BLUR)));
         wsum += w;
+        wmax = max(wmax, w);
     }
+    float th    = acos(clamp(dot(normalize(rd), gHoleDir), -1.0, 1.0));
+    float span  = max(2.0 * disp * length(bend), 2.0 * ca * th);
+    float pix   = max(max(length(dFdx(dG)), length(dFdy(dG))), 1e-6);
+    float sepPx = span / float(SPLIT_N - 1) / pix;
+    vec3  norm  = mix(wsum, wmax, clamp(sepPx, 0.0, 1.0));
     return glow + acc / wsum;
 }
 
@@ -954,10 +1114,22 @@ float ringDensity(float r, float R, int k) {
     return clamp(d * smoothstep(0.0, 0.05, u) * smoothstep(1.0, 0.92, u), 0.0, 1.0);
 }
 
+#define PULSAR_SPIN_TURNS 2.0
+#define PULSAR_SPIN_CONE  1.5707963
+#define PULSAR_SPIN_HOLE 1
+vec3 gRo = vec3(0.0);
+vec3 getPulsarAxisAt(vec3 pP) {
+    float ph = 6.28318530718 * fract(PULSAR_SPIN_TURNS * tempoBeatCount());
+    vec3 c  = normalize(gRo - pP);
+    vec3 U  = normalize(gCamU - c * dot(gCamU, c));
+    return normalize(cos(ph) * U + sin(ph) * c);
+}
 vec3 getPulsarAxis() {
     vec3 u, v, n;
     gearBasis(float(GEAR_BINARY), u, v, n);
-    return n;
+    if (PULSAR_SPIN_TURNS == 0.0) return n;
+    float ph = 6.28318530718 * fract(PULSAR_SPIN_TURNS * tempoBeatCount());
+    return normalize(cos(PULSAR_SPIN_CONE) * n + sin(PULSAR_SPIN_CONE) * (cos(ph) * u + sin(ph) * v));
 }
 
 #define JET_BACK 0.6
@@ -1010,7 +1182,6 @@ ivec2 gPix = ivec2(0);
 #define GEO_N_S      32.0
 float kerrW(int layer) { return texelFetch(u_kerrpaths, ivec3(gPix, layer), 0).w; }
 
-vec3 gRo = vec3(0.0);
 vec3 gRd = vec3(0.0, 0.0, 1.0);
 
 float geoImpactParam(vec3 ro, vec3 rd) {
@@ -1076,6 +1247,64 @@ bool geoSegSphere(vec3 A, vec3 B, vec3 c, float rad, out float tHit, out vec3 hi
     tHit   = max(t, 0.0);
     hitPos = A + d * tHit;
     return true;
+}
+
+#define DROP_ON    1
+#define DROP_FAR   0.80
+#define DROP_NEAR  0.36
+#define DROP_LEN   2.6
+#define DROP_PINCH 3.0
+#define DROP_SHRINK 0.25
+float dropK(vec3 c) {
+    return DROP_ON == 1 ? smoothstep(DROP_FAR, DROP_NEAR, length(c)) : 0.0;
+}
+float sdDrop(vec3 p, vec3 c, float R, float k) {
+    vec3  ax = -normalize(c);
+    float L  = max(k * DROP_LEN * R, 1e-6 * R);
+    float r1 = R * (1.0 - DROP_SHRINK * k);
+    vec3  d  = p - c;
+    float s  = dot(d, ax);
+    if (s <= 0.0) return length(d) - r1;
+    if (s >= L)   return length(d - ax * L);
+    float q  = length(d - ax * s);
+    float u  = s / L;
+    float om = 1.0 - u;
+    float rho   = r1 * pow(om, DROP_PINCH) * (1.0 + DROP_PINCH * u);
+    float slope = r1 / L * DROP_PINCH * (1.0 + DROP_PINCH) * u * pow(om, DROP_PINCH - 1.0);
+    return (q - rho) / sqrt(1.0 + slope * slope);
+}
+vec3 dropNormal(vec3 p, vec3 c, float R, float k) {
+    if (k < 1e-3) return normalize(p - c);
+    float e = 0.002 * R;
+    vec2  h = vec2(e, 0.0);
+    return normalize(vec3(sdDrop(p + h.xyy, c, R, k) - sdDrop(p - h.xyy, c, R, k),
+                          sdDrop(p + h.yxy, c, R, k) - sdDrop(p - h.yxy, c, R, k),
+                          sdDrop(p + h.yyx, c, R, k) - sdDrop(p - h.yyx, c, R, k)));
+}
+bool geoSegDrop(vec3 A, vec3 B, vec3 c, float R, float k, out float tHit, out vec3 hitPos) {
+    if (k < 1e-3) return geoSegSphere(A, B, c, R, tHit, hitPos);
+    vec3  ab = B - A;
+    float L  = length(ab);
+    if (L < 1e-9) return false;
+    vec3  dir = ab / L;
+    float half_ = 0.5 * (k * DROP_LEN * R + R + R);
+    vec3  mid   = c - normalize(c) * (0.5 * k * DROP_LEN * R);
+    vec3  m  = A - mid;
+    float bb = dot(m, dir);
+    float cc = dot(m, m) - half_ * half_;
+    if (cc > 0.0 && bb > 0.0) return false;
+    if (bb * bb - cc < 0.0) return false;
+    float t = max(0.0, -bb - sqrt(max(bb * bb - cc, 0.0)));
+    for (int i = 0; i < 48; i++) {
+        if (t > L) return false;
+        float d = sdDrop(A + dir * t, c, R, k);
+        if (d < 2e-4 * R) {
+            tHit = t / L; hitPos = A + dir * t;
+            return true;
+        }
+        t += 0.8 * d;
+    }
+    return false;
 }
 
 float geoSegPointD2(vec3 A, vec3 B, vec3 p) {
@@ -1216,8 +1445,8 @@ vec3 kelvinToRgb(float k) {
 #define DISK_D_SPAN   2.1
 #define DISK_TINT     0.85
 #define DISK_SAT      1.2
-#define DISK_SHIFT    0.7
-#define DISK_R_IN_VIS 1.5
+#define DISK_SHIFT    0.0
+#define DISK_R_IN_VIS 2.0
 #define DISK_BEAM_POW 1.5
 #define DISK_EXPOSE   1.6
 #define DISK_WHITE    6.0
@@ -1227,16 +1456,55 @@ vec3 diskToneSum(vec3 x) {
     float m = l * (1.0 + l / (DISK_WHITE * DISK_WHITE)) / (1.0 + l);
     return x * (DISK_EXPOSE * m / l);
 }
-#define DISK_COVER    0.0
+#define DISK_COVER    0.5
 #define DISK_GLOW     1.0
 float gDiskTr = 1.0;
-#define DISK_SHOW     1
+#define DISK_SHOW     0
+#define FLARE_ON      1
+#define FLARE_START   -1.0
+#define FLARE_GROW    0.80
+#define FLARE_WRAP_SOFT 0.8
+#define DISK_H_SCALE  0.35
+#define FLARE_SHRINK  1.40
+#define FLARE_RMAX    6.0
+#define FLARE_SOFT    0.15
+#define DISK_ORANGE   1
+#define DISK_ORANGE_COL vec3(1.00, 0.165, 0.022)
+#define DISK_HOT_COL  vec3(1.00, 0.72, 0.42)
+#define DISK_HOT_GAIN 2.0
+#define DISK_HOT_POW  2.0
+#define FLARE_PERIOD 256.0
+const float FLARE_PERI[14] = float[14](25.304, 41.362, 57.414, 73.466, 89.516, 105.580, 129.650,
+                                       151.480, 167.546, 183.598, 199.654, 215.712, 231.772, 255.866);
+float gDiskEdge = 0.0;
+float gFlareDt = 0.0;
+float flareWrap(float phi, float phD) {
+    if (FLARE_ON == 0) return 1.0;
+    float sweep = (6.28318530718 + FLARE_WRAP_SOFT) * clamp(gFlareDt / FLARE_GROW, 0.0, 1.0);
+    float dph = mod(phi - phD, 6.28318530718);
+    return clamp((sweep - dph) / FLARE_WRAP_SOFT, 0.0, 1.0);
+}
+float flareEdge() {
+    if (FLARE_ON == 0) return FLARE_RMAX;
+    float cm = mod(tempoBeatCount(), FLARE_PERIOD);
+    for (int k = 0; k < 14; k++) {
+        float dt = mod(cm - FLARE_PERI[k] - FLARE_START, FLARE_PERIOD);
+        float e = -1.0;
+        if (dt >= 0.0 && dt < FLARE_GROW) {
+            e = 1.0;
+        } else if (dt >= FLARE_GROW && dt < FLARE_GROW + FLARE_SHRINK) {
+            float x = (dt - FLARE_GROW) / FLARE_SHRINK;  e = 1.0 - x * x;
+        }
+        if (e >= 0.0) { gFlareDt = dt; return mix(DISK_R_IN_VIS, FLARE_RMAX, e); }
+    }
+    return 0.0;
+}
 uniform sampler2D u_kntable;
-#define KN_RIN        0.572600
-#define KN_ROUT       7.274607
+#define KN_RIN        2.0
+#define KN_ROUT       20.0
 #define DSIM_TLOOP    33.3932
-#define DSIM_RIN      0.572600
-#define DSIM_ROUT     7.274607
+#define DSIM_RIN      2.0
+#define DSIM_ROUT     20.0
 #define DISK_HR       0.1
 #define DISK_TAU0     0.3
 #define DISK_LOOP_S   10.0
@@ -1274,7 +1542,24 @@ float streakField(float rR, float phs, float seed) {
     n /= tot;
     return mix(0.35, 1.75, smoothstep(0.2, 0.85, n));
 }
+#define DISK_LIVE 1
+
+float diskLiveContrast(float rR, float phi) {
+    float rSim = rR;
+    float x = log(clamp(rSim, u_disk_rin, u_disk_rout));
+    float u = (x - u_disk_x0) / (log(u_disk_rout) - u_disk_x0);
+    float v = phi / 6.28318530718;
+    vec4 st = texture(u_disklive, vec2(u, v));
+    float S = max(st.x, 1e-8);
+    float S0 = pow(rSim, -0.5) * (1.0 - 0.7 * exp(-(rSim - u_disk_rin) / (0.3 * u_disk_rin)));
+    return S / max(S0, 1e-6);
+}
+
 float diskStreaks(float rR, float phi) {
+#if DISK_LIVE
+    #define DISK_LIVE_GAIN 15.0
+    return max(diskLiveContrast(rR, phi) * DISK_LIVE_GAIN, 0.0);
+#else
     float tS = diskClock() / DISK_LOOP_S * DSIM_TLOOP;
     float p  = tS / STREAK_P;
     float Om = knTable(rR).x;
@@ -1285,6 +1570,39 @@ float diskStreaks(float rR, float phi) {
     float ca = streakField(rR, phi - Om * pa * STREAK_P, sa) - 1.0;
     float cb = streakField(rR, phi - Om * pb * STREAK_P, sb) - 1.0;
     return max(1.0 + (wa * ca + wb * cb) / sqrt(max(wa * wa + wb * wb, 1e-4)), 0.0);
+#endif
+}
+
+vec4 diskEmitTr(float rR, float tr, float lam, float bassLvl) {
+    vec4  tab = knTable(rR);
+    float g   = 1.0 / max(tab.y * (1.0 - tab.x * lam), 1e-6);
+    float F   = tab.z;
+    float boost = pow(g, DISK_BEAM_POW);
+    vec3 hue = vec3(1.0);
+    float hotB = 1.0;
+    if (DISK_ORANGE == 1) {
+        float x   = clamp((rR - DISK_R_IN_VIS) / max(FLARE_RMAX - DISK_R_IN_VIS, 1e-3), 0.0, 1.0);
+        float hot = pow(1.0 - x, DISK_HOT_POW);
+        vec3  cO  = DISK_ORANGE_COL / dot(DISK_ORANGE_COL, vec3(0.299, 0.587, 0.114));
+        vec3  cH  = DISK_HOT_COL    / dot(DISK_HOT_COL,    vec3(0.299, 0.587, 0.114));
+        hue  = mix(cO, cH, hot);
+        hotB = 1.0 + DISK_HOT_GAIN * hot;
+    } else {
+        float D = 1.0 / max(1.0 - tab.x * lam, 1e-3);
+        float t = clamp(log(D) / log(DISK_D_SPAN), -1.0, 1.0);
+        vec3  tint = (t > 0.0) ? vec3(0.42, 0.64, 1.00) : vec3(1.00, 0.42, 0.22);
+        tint /= dot(tint, vec3(0.299, 0.587, 0.114));
+        hue = mix(hue, tint, abs(t) * DISK_TINT);
+        float hl = dot(hue, vec3(0.299, 0.587, 0.114));
+        hue = max(mix(vec3(hl), hue, DISK_SAT), 0.0);
+    }
+    vec3 src = hue * hotB * boost * F
+             * DISK_GAIN * DISK_SIM_GAIN * (0.70 + 0.90 * bassLvl);
+    if (DISK_TONE_K > 0.0 && DISK_THIN == 0) {
+        float lum = max(max(src.r, src.g), src.b);
+        if (lum > 0.0) src *= (log(1.0 + DISK_TONE_K * lum) / log(1.0 + DISK_TONE_K)) / lum;
+    }
+    return vec4(src * (1.0 - tr), tr);
 }
 
 vec4 diskShareShade(float rR, float phi, float colShare, float lam, float bassLvl) {
@@ -1294,27 +1612,414 @@ vec4 diskShareShade(float rR, float phi, float colShare, float lam, float bassLv
     c *= smoothstep(DISK_R_IN_VIS, DISK_R_IN_VIS * 1.02, rR);
     float tau = DISK_TAU0 * c * colShare / (2.50663 * DISK_HR * rR);
     float tr  = exp(-tau);
-    vec4  tab = knTable(rR);
-    float g   = 1.0 / max(tab.y * (1.0 - tab.x * lam), 1e-6);
-    float F   = tab.z;
-    float boost = pow(g, DISK_BEAM_POW);
-    vec3 hue = vec3(1.0);
+    return diskEmitTr(rR, tr, lam, bassLvl);
+}
+
+uniform float u_disk_hr0;
+uniform float u_disk_flare;
+#define DISK_HR_MAX   0.6
+#define DISK_H_CAP    2.5
+#define DISK_ZMAX     3.0
+#define DISK_VOL_N    16
+#define DISK_VOL_GAIN 1.0
+float diskHR0(float rR) { return u_disk_hr0 * pow(max(rR / u_disk_rin, 1e-3), u_disk_flare); }
+vec2 diskLiveCH(float rR, float phi) {
+    float x = log(clamp(rR, u_disk_rin, u_disk_rout));
+    float u = (x - u_disk_x0) / (log(u_disk_rout) - u_disk_x0);
+    vec4 st = texture(u_disklive, vec2(u, phi / 6.28318530718));
+    float S  = max(st.x, 1e-8);
+    float S0 = pow(rR, -0.5) * (1.0 - 0.7 * exp(-(rR - u_disk_rin) / (0.3 * u_disk_rin)));
+    float Om = max(knTable(rR).x, 1e-6);
+    float T  = (st.w > 0.0) ? st.w / S : pow(diskHR0(rR) * rR * Om, 2.0);
+    float H  = min(sqrt(max(T, 0.0)) / Om, min(DISK_H_CAP * diskHR0(rR), DISK_HR_MAX) * rR);
+    return vec2(S / max(S0, 1e-6), max(H * DISK_H_SCALE, 1e-4));
+}
+float erfA(float x) {
+    float t = 1.0 / (1.0 + 0.3275911 * abs(x));
+    float y = 1.0 - (((((1.061405429 * t - 1.453152027) * t) + 1.421413741) * t - 0.284496736) * t + 0.254829592) * t * exp(-x * x);
+    return sign(x) * y;
+}
+float gaussColumn(float z0, float z1, float L, float H) {
+    float dz = z1 - z0;
+    if (abs(dz) < 1e-4 * H) return L * exp(-0.5 * z0 * z0 / (H * H));
+    float k = 0.70710678 / H;
+    return L / dz * 1.25331414 * H * (erfA(z1 * k) - erfA(z0 * k));
+}
+uniform float u_disk_time;
+#define DISK_DETAIL      1.0
+#define FLARE_RAGGED     0.20
+#define FLARE_FRONT_RAG  0.9
+#define DISK_DETAIL_MEAN 1.55
+float knPerlin(vec3 P) {
+    vec3 I = floor(P), F = fract(P);
+    vec3 Sx = 3.0 * F * F - 2.0 * F * F * F;
+    #define KNH(o) (2.0 * fract(sin(dot(I + o, vec3(12.9898, 78.233, 213.765))) * 43758.5453) - 1.0)
+    float v000 = KNH(vec3(0,0,0)), v100 = KNH(vec3(1,0,0)), v010 = KNH(vec3(0,1,0)), v110 = KNH(vec3(1,1,0));
+    float v001 = KNH(vec3(0,0,1)), v101 = KNH(vec3(1,0,1)), v011 = KNH(vec3(0,1,1)), v111 = KNH(vec3(1,1,1));
+    #undef KNH
+    return mix(mix(mix(v000, v100, Sx.x), mix(v010, v110, Sx.x), Sx.y),
+               mix(mix(v001, v101, Sx.x), mix(v011, v111, Sx.x), Sx.y), Sx.z);
+}
+float knDiskNoise(vec3 P, float lo, float hi, float con) {
+    float acc = 10.0;
+    for (int i = int(floor(lo)); i < int(ceil(hi)); i++) {
+        float w = max(0.0, min(hi, float(i) + 1.0) - max(lo, float(i)));
+        if (w <= 0.0) continue;
+        acc *= 1.0 + 0.1 * knPerlin(pow(3.0, float(i)) * P) * w;
+    }
+    return log(1.0 + pow(0.1 * acc, con));
+}
+float knSpiral(float r) {
+    float u = sqrt(r), kc = pow(KERR_A * 0.5 * 0.70710678, 0.33333333);
+    return (5.6568542 / kc) * (0.5 * log(max(1e-9, (r - kc * u + kc * kc) / max(1e-9, (u + kc) * (u + kc))))
+         + 1.7320508 * (atan(2.0 * u - kc, 1.7320508 * kc) - 1.5707963));
+}
+float knWrap(float x) { return x - 6.28318530718 * floor((x + 3.14159265359) / 6.28318530718); }
+float diskKNDetail(float r, float th, float y) {
+    float t  = u_disk_time;
+    float RO = DSIM_ROUT;
+    float GT = 0.75 + max(0.0, (r - 3.0) * 0.24);
+    float NL = max(0.0, 2.0 - 0.6 * GT);
+    float Lm = 0.91 * log(1.0 + 0.06 / 0.91 * max(0.0, r - 10.0));
+    float Cm = 80.0 * log(1.0 + 0.006 * max(0.0, r - 10.0));
+    float cS = 0.02 * pow(RO, 0.7);
+    float PT = knWrap(th + knSpiral(r));
+    float m  = knDiskNoise(vec3(0.1 * (r + 0.25 / 3.0 * t), 0.1 * y, cS * PT), NL + 2.0 - Lm, NL + 4.0 - Lm, 80.0 - Cm);
+    if (PT + 3.14159265 < 0.1 * 3.14159265) {
+        float f = (PT + 3.14159265) / (0.1 * 3.14159265);
+        m = m * f + (1.0 - f) * knDiskNoise(vec3(0.1 * (r + 0.25 / 3.0 * t), 0.1 * y, cS * (PT + 6.28318531)), NL + 2.0 - Lm, NL + 4.0 - Lm, 80.0 - Cm);
+    }
+    if (r > max(0.15379 * RO, 0.15379 * 64.0)) {
+        float PL = knWrap(th + 2.0 * log(r));
+        float TS = r * 4.65114e-6 - 0.1 / 3.0 * t;
+        float sp = knDiskNoise(vec3(0.1 * (TS - 0.08 * RO * PL), 0.1 * y, cS * PL), NL + 2.0 - Lm, NL + 3.0 - Lm, 80.0 - Cm);
+        float wm = 0.5 + 0.5 * max(-1.0, 1.0 - exp(-0.15 * (100.0 * r / max(RO, 64.0) - 20.0)));
+        m *= mix(1.0, clamp(0.7 * sp * 1.5 - 0.5, 0.0, 3.0), wm);
+    }
+    return mix(1.0, m / DISK_DETAIL_MEAN, DISK_DETAIL);
+}
+
+#define KN_DISK        1
+#define KN_R_IN        2.0
+#define KN_R_OUT       6.0
+#define KN_THIN        0.75
+#define KN_HOPPER      0.24
+#define KN_BRIGHT      1.4
+#define KN_DARK        0.5
+#define KN_REDDEN      0.3
+#define KN_SAT         0.5
+#define KN_BB_EXP      0.5
+#define KN_RS_COL_EXP  3.0
+#define KN_RS_INT_EXP  4.0
+#define KN_RING_BOOST  11.0
+#define KN_RING_TBOOST 2.8
+#define KN_BOOST_ROT   1.0
+#define KN_SHIFT_MAX   1.0
+#define KN_DISK_ARG    2.071973e+20
+#define KN_PEAK_T      5.853308e+04
+#define KN_TIME_RATE   2.0
+#define KN_STEP        1.0
+#define KN_MAX_IT      400
+#define KN_GAIN        1.0
+#define KN_A           (KERR_A * 0.5)
+#define KN_Q           (0.07 * 0.5)
+#define KN_LIFE        1
+#define STATE_KN_PX    40
+#define KN_START_K     0.35
+#define KN_END_K       0.02
+#define KN_MIN_IN      0.5
+#define KN_MIN_OUT     0.8
+#define KN_LINGER      1.0
+#define KN_INFALL_F    0.4
+#define KN_NOISE_RATE  20.0
+#define KN_WRAP_SOFT   0.8
+#define KN_FRONT_RAG   0.9
+#define KN_EDGE_SOFT   0.12
+#define KN_EDGE_RAG    0.15
+float gKNSince = -1.0;
+float gKNPeri  = -1e9;
+float gKNIn    = 1.0;
+float gKNOut   = 1.0;
+float gKNTau   = 0.0;
+float gKNSeed  = 0.0;
+bool  gKNOn    = true;
+float dropK(vec3 c);
+vec3  starTouchPosAt(int star, float c);
+float knOmegaK(float r);
+#define KN_SAMP_PX     48
+#define KN_SAMP_N      80
+#define KN_SAMP_H      0.1
+#define KN_STARS       2
+#define KN_DWARF_GAIN  0.6
+#define KN_DWARF_TEMP  0.75
+#define KN_MIN_LEAD    1.0
+#define KN_MIN_LEAD_P  1.5
+#define KN_SNAP        0.5
+float knDK(int star, float c) { return dropK(starTouchPosAt(star, c)); }
+vec4  knSample(int star, float c) { vec3 p = starTouchPosAt(star, c); return vec4(dropK(p), c, length(p), 0.0); }
+vec4 knPassTrack(float c, int row) {
+    int ib = 0; float best = 1e9;
+    for (int k = 0; k < KN_SAMP_N; k++) {
+        float rz = texelFetch(iChannel0, ivec2(KN_SAMP_PX + k, row), 0).z;
+        if (rz < best) { best = rz; ib = k; }
+    }
+    vec2 pk = texelFetch(iChannel0, ivec2(KN_SAMP_PX + ib, row), 0).xy;
+    if (pk.x < 0.9) return vec4(-1.0, -1e9, 1.0, 1.0);
+    float tS = texelFetch(iChannel0, ivec2(KN_SAMP_PX, row), 0).y;
+    float tE = texelFetch(iChannel0, ivec2(KN_SAMP_PX + KN_SAMP_N - 1, row), 0).y;
+    for (int k = ib; k > 0; k--) {
+        vec2 a = texelFetch(iChannel0, ivec2(KN_SAMP_PX + k - 1, row), 0).xy, b = texelFetch(iChannel0, ivec2(KN_SAMP_PX + k, row), 0).xy;
+        if (a.x < KN_START_K) { tS = mix(a.y, b.y, clamp((KN_START_K - a.x) / max(b.x - a.x, 1e-6), 0.0, 1.0)); break; }
+    }
+    for (int k = ib; k < KN_SAMP_N - 1; k++) {
+        vec2 a = texelFetch(iChannel0, ivec2(KN_SAMP_PX + k, row), 0).xy, b = texelFetch(iChannel0, ivec2(KN_SAMP_PX + k + 1, row), 0).xy;
+        if (b.x < KN_END_K) { tE = mix(a.y, b.y, clamp((a.x - KN_END_K) / max(a.x - b.x, 1e-6), 0.0, 1.0)); break; }
+    }
+    tS = min(tS, pk.y - (row == 2 ? KN_MIN_LEAD_P : KN_MIN_LEAD));
+    tS = KN_SNAP * floor(tS / KN_SNAP + 1e-4);
+    return vec4(c - tS, c - pk.y, pk.y - tS, tE - pk.y);
+}
+int   gKNStar = 0;
+float gKNGain = 1.0;
+float gKNTemp = 1.0;
+void knLifeFrame() {
+    if (KN_LIFE == 0) { gKNOn = true; gKNTau = KN_TIME_RATE * iTime; return; }
+    float c  = tempoBeatCount();
+    vec4  sP = texelFetch(iChannel0, ivec2(STATE_KN_PX, 0), 0);
+    vec4  sD = texelFetch(iChannel0, ivec2(STATE_KN_PX + 1, 0), 0);
+    bool  vP = (KN_STARS != 1) && sP.y > -1e8;
+    bool  vD = (KN_STARS != 0) && sD.y > -1e8;
+    float s0P = c - sP.x, pkP = c - sP.y, enP = pkP + max(sP.w + KN_LINGER, KN_MIN_OUT);
+    float s0D = c - sD.x, pkD = c - sD.y, enD = pkD + max(sD.w + KN_LINGER, KN_MIN_OUT);
+    bool  merge = vP && vD && ((s0P <= s0D) ? (s0D <= enP) : (s0P <= enD));
+    float tS, tP0, tP1, tE, gF, gL, kF, kL; int stF, stL;
+    if (merge) {
+        bool pF = pkP <= pkD;
+        tS  = min(s0P, s0D);
+        tP0 = pF ? pkP : pkD;  tP1 = pF ? pkD : pkP;  tE = pF ? enD : enP;
+        stF = pF ? 0 : 1;      stL = pF ? 1 : 0;
+    } else {
+        bool useP = vP && (!vD || abs(c - pkP) <= abs(c - pkD));
+        tS  = useP ? s0P : s0D;  tP0 = useP ? pkP : pkD;  tP1 = tP0;  tE = useP ? enP : enD;
+        stF = useP ? 0 : 1;      stL = stF;
+        if (!vP && !vD) { gKNOn = false; return; }
+    }
+    gF = (stF == 0) ? 1.0 : KN_DWARF_GAIN;  gL = (stL == 0) ? 1.0 : KN_DWARF_GAIN;
+    kF = (stF == 0) ? 1.0 : KN_DWARF_TEMP;  kL = (stL == 0) ? 1.0 : KN_DWARF_TEMP;
+    float w = (tP1 > tP0) ? smoothstep(tP0, tP1, c) : 0.0;
+    gKNGain  = mix(gF, gL, w);
+    gKNTemp  = mix(kF, kL, w);
+    gKNStar  = (w < 0.5) ? stF : stL;
+    gKNSince = c - tS;
+    gKNIn    = max(tP0 - tS, KN_MIN_IN);
+    gKNPeri  = c - tP1;
+    gKNOut   = max(tE - tP1, 1e-3);
+    gKNOn    = (gKNSince >= 0.0) && (c < tE);
+    gKNSeed  = 53.0 * mod(floor(tP0 + 0.5), 97.0);
+    gKNTau   = KN_NOISE_RATE * gKNSince + gKNSeed;
+}
+float knLife(float r, float th, float y, float phD) {
+    if (KN_LIFE == 0) return 1.0;
+    float since = gKNSince - KN_INFALL_F * gKNIn * (KN_R_OUT - r) / (KN_R_OUT - KN_R_IN);
+    if (since <= 0.0) return 0.0;
+    float rate  = (6.28318530718 + KN_WRAP_SOFT + KN_FRONT_RAG) / (knOmegaK(KN_R_OUT) * gKNIn);
+    float front = knOmegaK(r) * rate * since;
+    float dph = mod(th - phD + KN_FRONT_RAG * knPerlin(vec3(1.3 * r, 0.5 * y, 2.0 * gKNSince + gKNSeed)), 6.28318530718);
+    float wind = clamp((front - dph) / KN_WRAP_SOFT, 0.0, 1.0);
+    float x = clamp(gKNPeri / gKNOut, 0.0, 1.0);
+    if (x >= 1.0) return 0.0;
+    float edge = KN_R_IN * pow(KN_R_OUT / KN_R_IN, 1.0 - x);
+    edge *= 1.0 + KN_EDGE_RAG * knPerlin(vec3(2.0 * cos(th), 2.0 * sin(th), 0.7 * r + 3.0 * gKNSince + gKNSeed));
+    return wind * (1.0 - smoothstep(edge * (1.0 - KN_EDGE_SOFT), edge, r));
+}
+vec3 gKNEmit = vec3(0.0);
+vec3 gKNTr   = vec3(1.0);
+
+float knKSRadius(float rho2, float y2) {
+    float a2 = KN_A * KN_A;
+    float b  = rho2 + y2 - a2;
+    float de = sqrt(b * b + 4.0 * a2 * y2);
+    float r2 = (b >= 0.0) ? 0.5 * (b + de) : (2.0 * a2 * y2) / max(1e-20, de - b);
+    return sqrt(r2);
+}
+float knOmegaK(float r) {
+    float m = 0.5 * r - KN_Q * KN_Q;
+    if (m < 0.0) return 0.0;
+    float s = sqrt(m);
+    return s / max(1e-6, r * r + KN_A * s);
+}
+vec3 knKelvin(float K) {
+    if (K < 400.01) return vec3(0.0);
+    float Te = (K - 6500.0) / (6500.0 * K * 2.2);
+    vec3  c  = vec3(exp(2.05539304e4 * Te), exp(2.63463675e4 * Te), exp(3.30145739e4 * Te));
+    float s  = 1.0 / max(max(1.5 * c.r, c.g), c.b);
+    if (K < 1000.0) s *= (K - 400.0) / 600.0;
+    return c * s;
+}
+float knShapeF(float x, float al, float be) {
+    float k = pow(al + be, al + be) / (pow(al, al) * pow(be, be));
+    return k * pow(max(x, 0.0), al) * pow(max(1.0 - x, 0.0), be);
+}
+float knSoftSat(float x) { return 1.0 - 1.0 / (max(x, 0.0) + 1.0); }
+vec3 knToneMap(vec4 R) {
+    float s  = R.r + R.g + R.b + 1e-6;
+    vec3  f  = 3.0 * R.rgb / s;
+    vec3  m  = -4.0 * log(1.0 - pow(clamp(R.rgb, 0.0, 0.999), vec3(2.2)));
+    return min(m, 8.0 * f);
+}
+float knShellStep(vec3 A, vec3 B, float rA, float rB) {
+    if (rB >= 1.6 + pow(KERR_A, 0.666666)) return 0.0;
+    vec3  d  = B - A;
+    float L  = length(d);
+    if (L < 1e-9) return 0.0;
+    float dr = rB - rA;
+    float rot = clamp(1.0 + KN_BOOST_ROT * dot(-d, vec3(B.z, 0.0, -B.x)) / L / max(length(B.xz), 1e-6) * KERR_A, 0.0, 2.0);
+    return L / (0.5 * rA + 0.5 * rB) / (1.0 + 1000.0 * (dr / L) * (dr / L)) * rot
+         * clamp(11.0 - 10.0 * (KERR_A * KERR_A + 0.07 * 0.07), 0.0, 1.0);
+}
+void knDiskChord(vec3 A, vec3 B, float arc0, float lam, float shell, float phD, inout vec4 acc, inout float phase) {
+    float MH = KN_THIN + max(0.0, KN_HOPPER * KN_R_OUT) + 2.0;
+    if ((A.y > MH && B.y > MH) || (A.y < -MH && B.y < -MH)) return;
+    vec2  P0 = A.xz, V = B.xz - A.xz;
+    float L2 = dot(V, V);
+    vec2  CP = P0 + V * ((L2 > 1e-8) ? clamp(-dot(P0, V) / L2, 0.0, 1.0) : 0.0);
+    if (dot(CP, CP) > 1.21 * KN_R_OUT * KN_R_OUT) return;
+    if (max(knKSRadius(dot(A.xz, A.xz), A.y * A.y), knKSRadius(dot(B.xz, B.xz), B.y * B.y)) < KN_R_IN * 0.9) return;
+    float Tot  = length(B - A);
+    if (Tot < 1e-9) return;
+    float cosY = abs((B.y - A.y) / Tot);
+    float trav = 0.0;
+    const float PI = 3.14159265359;
+    float RIO = KN_R_OUT - KN_R_IN;
+    for (int it = 0; it < KN_MAX_IT; it++) {
+        if (trav >= Tot || acc.a > 0.99) break;
+        float D  = length(mix(A, B, trav / Tot));
+        float SB = max(KN_R_OUT, 12.0);
+        float St = 0.15 + 0.25 * min(max(0.0, 0.5 * (0.5 * D / max(10.0, SB) - 1.0)), 1.0);
+        if (D >= 2.0 * SB) St *= D;
+        else if (D >= SB) St *= ((1.0 + 0.25 * max(D - 12.0, 0.0)) * (2.0 * SB - D) + D * (D - SB)) / SB;
+        else St *= min(1.0 + 0.25 * max(D - 12.0, 0.0), D);
+        St = max(0.01, St) * KN_STEP;
+        float nxt = min(Tot, trav + phase * St);
+        if (nxt < Tot) { phase = 1.0; trav = nxt; }
+        else { phase = max(0.0, phase - (Tot - trav) / St); trav = Tot; break; }
+
+        vec3  S    = mix(A, B, trav / Tot);
+        float tEm  = gKNTau - (arc0 + trav);
+        float y    = S.y;
+        float PosR = knKSRadius(dot(S.xz, S.xz), y * y);
+        float GT   = KN_THIN + max(0.0, (length(S.xz) - 3.0) * KN_HOPPER);
+        float ICB  = max(GT, KN_THIN) * max(0.0, 1.0 - 5.0 * pow((PosR - KN_R_IN) / min(RIO, 12.0), 2.0));
+        if (!(abs(y) < max(GT * 1.5, ICB) && PosR < KN_R_OUT && PosR > KN_R_IN)) continue;
+
+        float th  = atan(S.z, S.x);
+        float lifeM = knLife(PosR, th, y, phD);
+        if (lifeM <= 0.0) continue;
+        float NL  = max(0.0, 2.0 - 0.6 * GT);
+        float x   = (PosR - KN_R_IN) / max(1e-6, RIO);
+        float ap  = max(1.0, RIO / 10.0);
+        float ER  = (ap == 1.0) ? x : (-1.0 + sqrt(max(0.0, 1.0 + 4.0 * ap * ap * x - 4.0 * x * ap))) / (2.0 * ap - 2.0);
+        float DT  = knShapeF(ER, 0.9, 1.5);
+        float PL  = knWrap(th + 2.0 * log(max(1e-6, PosR)));
+        float tk  = 0.4 + 0.6 * clamp(GT - 0.5, 0.0, 2.5) / 2.5;
+        float PTk = max(1e-6, GT * DT * (tk + (1.0 - tk) * knSoftSat(knDiskNoise(vec3(1.5 * PL, PosR + 0.25 / 3.0 * tEm, 0.0), -0.7 + NL, 1.3 + NL, 80.0))));
+        if (!(abs(y) < PTk || abs(y) < ICB)) continue;
+
+        float Om = knOmegaK(max(KN_R_IN, PosR));
+        float PT = knWrap(th + knSpiral(PosR));
+        float ir = 1.0 / max(1e-6, PosR);
+        float Vp = ir - KN_Q * KN_Q * ir * ir;
+        float gtt = -(1.0 - Vp), gtp = -KN_A * Vp, gpp = PosR * PosR + KN_A * KN_A + KN_A * KN_A * Vp;
+        float nm  = gtt + 2.0 * Om * gtp + Om * Om * gpp;
+        float ut  = inversesqrt(max(0.01, -nm));
+        float Eem = ut * (1.0 - Om * lam);
+        float FR  = 1.0 / max(1e-6, Eem);
+        float Tb  = pow(KN_DISK_ARG * ir * ir * ir * max(1.0 - sqrt(KN_R_IN * ir), 1e-6), 0.25);
+        float VT  = Tb * pow(FR, KN_RS_COL_EXP);
+        float BW  = (0.05 * min(KN_R_OUT / 1000.0, 1000.0 / KN_R_OUT)
+                  + 0.55 / exp(5.0 * ER) * mix(0.2 + 0.8 * cosY, 1.0, clamp(GT - 0.8, 0.2, 1.0)))
+                  * pow(Tb / KN_PEAK_T, KN_BB_EXP);
+
+        float Den = DT;
+        vec4  SC  = vec4(0.0);
+        if (abs(y) < PTk) {
+            float Lm = 0.91 * log(1.0 + (0.06 / 0.91 * max(0.0, min(1000.0, PosR) - 10.0)));
+            float Cm = 80.0 * log(1.0 + (0.1 * 0.06 * max(0.0, PosR - 10.0)));
+            float cS = 0.02 * pow(KN_R_OUT, 0.7);
+            vec3  nP = vec3(0.1 * (PosR + 0.25 / 3.0 * tEm), 0.1 * y, cS * PT);
+            SC = vec4(knDiskNoise(nP, NL + 2.0 - Lm, NL + 4.0 - Lm, 80.0 - Cm));
+            if (PT + PI < 0.1 * PI) {
+                float f = (PT + PI) / (0.1 * PI);
+                SC = SC * f + (1.0 - f) * vec4(knDiskNoise(vec3(nP.xy, cS * (PT + 2.0 * PI)), NL + 2.0 - Lm, NL + 4.0 - Lm, 80.0 - Cm));
+            }
+            if (PosR > max(0.15379 * KN_R_OUT, 0.15379 * 64.0)) {
+                float TS = PosR * 4.65114e-6 - 0.1 / 3.0 * tEm;
+                float sp = knDiskNoise(vec3(0.1 * (TS - 0.08 * KN_R_OUT * PL), 0.1 * y, cS * PL), NL + 2.0 - Lm, NL + 3.0 - Lm, 80.0 - Cm);
+                SC *= mix(1.0, clamp(0.7 * sp * 1.5 - 0.5, 0.0, 3.0), 0.5 + 0.5 * max(-1.0, 1.0 - exp(-0.15 * (100.0 * PosR / max(KN_R_OUT, 64.0) - 20.0))));
+            }
+            Den *= 0.7 * max(0.0, 1.0 - abs(y) / PTk);
+            float yr = clamp(abs(y) / PTk, 0.0, 1.0);
+            SC.xyz *= Den * 1.4 * max(0.0, 0.2 + 2.0 * sqrt(max(0.0, yr * yr + 0.001)));
+            SC.a   *= Den * Den / 0.3;
+        }
+        float rg = clamp(0.3 * shell - 0.1, 0.0, 1.0);
+        SC.xyz *= 1.0 + clamp(KN_RING_BOOST, 0.0, 10.0) * rg;
+        VT     *= 1.0 + clamp(KN_RING_TBOOST, 0.0, 10.0) * rg;
+        VT     *= gKNTemp;
+
+        float cP = knOmegaK(max(3.0, KN_R_IN)) * tEm;
+        if (abs(y) < ICB) {
+            float DI = max(1.0 - pow(y / (GT * max(1.0 - 5.0 * pow((PosR - KN_R_IN) / min(RIO, 12.0), 2.0), 0.0001)), 2.0), 0.0);
+            if (DI > 0.0) {
+                float ang = knWrap(th - 0.666666 * cP);
+                float n   = knDiskNoise(vec3(1.5 * fract((1.5 * ang + cP) / 2.0 / PI) * 2.0 * PI, PosR, y), 0.0, 6.0, 80.0);
+                SC += 0.02 * vec4(vec3(DI * n), 0.2 * DI * n) * sqrt(max(0.0, 1.0001 - cosY * cosY));
+            }
+        }
+
+        SC.xyz *= BW * knKelvin(VT) * min(pow(FR, KN_RS_INT_EXP), KN_SHIFT_MAX) * min(1.0, 1.3 * (KN_R_OUT - PosR) / RIO);
+        SC.a   *= 0.125;
+        float DOR = mix(min(KN_R_OUT, 25.0), KN_R_OUT, smoothstep(6.0, max(0.05 * KN_R_OUT, 12.0), PosR));
+        SC *= max(vec4(5.0 / (max(KN_THIN, 0.2) + (KN_HOPPER * 0.5) * DOR)),
+                  mix(vec4(100.0 / DOR), vec4(vec3(0.3 + 0.7 * 100.0 / DOR), 1.0), exp(-pow(20.0 * PosR / DOR, 2.0))));
+        float IBF = mix(3.0, 2.0, clamp((KN_R_OUT - 50.0) / 50.0, 0.0, 1.0));
+        float IBR = 1.0 - clamp(6.0 * (PosR - KN_R_IN) / RIO, 0.0, 1.0);
+        IBR *= IBR;
+        SC.xyz *= mix(1.0, max(1.0, cosY / 0.2), clamp(0.3 - 0.6 * (PTk / max(1e-6, Den) - 1.0), 0.0, 0.3))
+                * (1.0 + 1.2 * max(0.0, max(0.0, min(1.0, 3.0 - 2.0 * KN_THIN)) * min(0.5, 1.0 - 5.0 * KN_HOPPER)))
+                * KN_BRIGHT * (1.0 + IBF * IBR);
+        SC.a   *= KN_DARK * (1.0 + (1.0 + IBF) * IBR);
+        if (Eem < 0.0) SC = vec4(0.0);
+        SC *= lifeM * gKNGain;
+
+        vec4  SCs = SC * St;
+        float oa  = 1.0 - acc.a;
+        float wR  = pow(oa, 1.0), wG = pow(oa, 1.0 + 2.0 * KN_REDDEN), wB = pow(oa, 1.0 + 5.0 * KN_REDDEN);
+        float Dn  = SCs.r * wR + SCs.g * wG + SCs.b * wB;
+        if (Dn > 1e-6) {
+            float Sum = (SCs.r + SCs.g + SCs.b) * wG;
+            vec3  c3  = Sum * vec3(SCs.r * wR, SCs.g * wG, SCs.b * wB) / Dn;
+            float cs  = c3.r + c3.g + c3.b;
+            acc.rgb  += c3 * pow(max(3.0 * c3 / max(cs, 1e-12), vec3(0.0)), vec3(KN_SAT));
+        }
+        acc.a += SCs.a * (1.0 - acc.a);
+    }
+}
+
+vec4 diskVolShade(float rR, float phi, float zMid, float col, float lam, float bassLvl) {
+    if (rR <= 0.0 || col <= 0.0) return vec4(0.0, 0.0, 0.0, 1.0);
+    vec2  ch = diskLiveCH(rR, phi);
+    float c  = max(ch.x, 0.0) * diskKNDetail(rR, phi, zMid);
+    c *= 1.0 - exp(-2.5 * max(DSIM_ROUT - rR, 0.0) / (0.35 * DSIM_ROUT));
+    c *= smoothstep(DISK_R_IN_VIS, DISK_R_IN_VIS * 1.02, rR);
     {
-        float D = 1.0 / max(1.0 - tab.x * lam, 1e-3);
-        float t = clamp(log(D) / log(DISK_D_SPAN), -1.0, 1.0);
-        vec3  tint = (t > 0.0) ? vec3(0.42, 0.64, 1.00) : vec3(1.00, 0.42, 0.22);
-        tint /= dot(tint, vec3(0.299, 0.587, 0.114));
-        hue = mix(hue, tint, abs(t) * DISK_TINT);
-        float hl = dot(hue, vec3(0.299, 0.587, 0.114));
-        hue = max(mix(vec3(hl), hue, DISK_SAT), 0.0);
+        float wob = knPerlin(vec3(2.0 * cos(phi), 2.0 * sin(phi), 0.7 * rR + 3.0 * gFlareDt));
+        float eR  = gDiskEdge * (1.0 + FLARE_RAGGED * wob);
+        c *= 1.0 - smoothstep(eR * (1.0 - FLARE_SOFT), eR, rR);
     }
-    vec3 src = hue * boost * F
-             * DISK_GAIN * DISK_SIM_GAIN * (0.70 + 0.90 * bassLvl);
-    if (DISK_TONE_K > 0.0 && DISK_THIN == 0) {
-        float lum = max(max(src.r, src.g), src.b);
-        if (lum > 0.0) src *= (log(1.0 + DISK_TONE_K * lum) / log(1.0 + DISK_TONE_K)) / lum;
-    }
-    return vec4(src * (1.0 - tr), tr);
+    float tau = DISK_TAU0 * c * col / (2.50663 * ch.y);
+    vec4  e = diskEmitTr(rR, exp(-tau), lam, bassLvl);
+    return vec4(e.rgb * DISK_VOL_GAIN, e.a);
 }
 
 vec3 diskBodyLight(vec3 wp, vec3 n) {
@@ -1487,14 +2192,14 @@ vec2 touchBracket(int star, float c) {
     return t + cyc * NL;
 }
 
-vec3 starTouchPos(int star) {
-    float c = tempoBeatCount();
+vec3 starTouchPosAt(int star, float c) {
     vec2  t = touchBracket(star, c);
     TOrb  o = starTOrb(star);
     float M = touchAnomaly(c, t, touchSolve(o, touchRotation(star, t.x)),
                                  touchSolve(o, touchRotation(star, t.y)), TOUCH_SUB);
     return rotAxis(torbBase(o, M), o.n, touchRotation(star, c));
 }
+vec3 starTouchPos(int star) { return starTouchPosAt(star, tempoBeatCount()); }
 
 #define PT_RP_PG     0.98
 #define PT_ECC_PG    0.75

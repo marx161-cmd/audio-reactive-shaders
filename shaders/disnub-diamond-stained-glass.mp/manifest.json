@@ -1,0 +1,27 @@
+{
+  "buffers": [
+    "A"
+  ],
+  "wiring": {
+    "A": {
+      "0": {
+        "type": "self"
+      }
+    },
+    "Image": {
+      "0": {
+        "type": "buffer",
+        "id": "A"
+      }
+    }
+  },
+  "static_textures": {
+    "u_backdrop": "textures/illusion_diamond/backdrops/azathoth_glass.png",
+    "u_glass": "textures/illusion_diamond/backdrops/azathoth_glass_data.png"
+  },
+  "static_texture_filters": {
+    "u_backdrop": "linear_mip",
+    "u_glass": "linear_mip"
+  },
+  "fps": 30
+}

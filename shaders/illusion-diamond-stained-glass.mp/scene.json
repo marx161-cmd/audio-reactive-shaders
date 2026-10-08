@@ -1,0 +1,45 @@
+{
+  "_doc": "Swappable scene for illusion_diamond (scope.md 2026-10-04): what hides inside the stone and what is behind it. Edit, then rerun: ~/onetrainer-gpu/.venv/bin/python tools/diamond_design.py shaders/illusion_diamond.mp",
+  "backdrop": "textures/illusion_diamond/backdrops/k7.png",
+  "walls": {
+    "_doc": "vertical internal cracks from the centre line (object y axis) outwards, at these angles (deg, in the xz plane); seen from the top they split the stone into chambers",
+    "radial_deg": []
+  },
+  "objects": [],
+  "stone": {
+    "facets": 72,
+    "tilt_deg": 38.0,
+    "pattern": "alternate",
+    "ior": "diamond",
+    "seed": 1
+  },
+  "_stars_v1": "the first build's two stars + three cracks + focus mirrors are kept in scene_stars_v1.json",
+  "portals": {
+    "_doc": "facets that open onto the star room for views leaving the stone from inside (cheat #4); axes 'cube' = the facets facing +-x/+-y/+-z; gate on the number of internal bounces",
+    "axes": "cube",
+    "min_bounces": 1,
+    "max_bounces": 6
+  },
+  "star_room": {
+    "_doc": "procedural star in space, the SAME window behind every portal (user): dir is in each portal's own frame, z = straight out of the portal facet; radius_deg = the star's angular radius; color = photosphere tint",
+    "dir": [
+      0.0,
+      0.0,
+      1.0
+    ],
+    "radius_deg": 80.0,
+    "color": [
+      1.0,
+      0.86,
+      0.66
+    ],
+    "intensity": 1.7
+  },
+  "portal_view": {
+    "_doc": "what the portal windows show: 'image' = a picture at 'dist' behind each portal, 'size' wide (world units; the stone is ~1.8 across) -> real parallax across a facet; 'star' = the procedural star (star_room)",
+    "mode": "image",
+    "image": "textures/illusion_diamond/backdrops/k1.png",
+    "dist": 0.8,
+    "size": 3.0
+  }
+}

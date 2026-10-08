@@ -1,0 +1,36 @@
+{
+  "buffers": [
+    "A"
+  ],
+  "wiring": {
+    "A": {
+      "0": {
+        "type": "self"
+      }
+    },
+    "Image": {
+      "0": {
+        "type": "buffer",
+        "id": "A"
+      }
+    }
+  },
+  "static_textures": {
+    "u_nebula": "textures/nebulabrot/nebula16384_rgba.npy",
+    "u_win0": "textures/nebulabrot/nebula_w0_rgba.npy",
+    "u_glitter": "textures/nebulabrot/nebula_glitter_mcmc16384_eq_rgba.npy",
+    "u_anti": "textures/nebulabrot/nebula_anti8192_rgba.npy",
+    "u_win1": "textures/nebulabrot/nebula_w1_rgba.npy"
+  },
+  "static_texture_filters": {
+    "u_nebula": "linear_mip",
+    "u_win0": "linear_mip",
+    "u_glitter": "linear_mip",
+    "u_anti": "linear_mip",
+    "u_win1": "linear_mip"
+  },
+  "fps": 60,
+  "persist": {
+    "buffer": "A"
+  }
+}

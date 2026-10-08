@@ -23,9 +23,12 @@
     "u_ringprof": "textures/pulsar_orrery/ringprof.npy",
     "u_kerrpaths": "textures/kerr_v7/kn/paths32.npy",
     "u_knsky": "textures/kerr_v7/kn/sky.npy",
-    "u_kntable": "textures/kerr_v7/kn_disk_table.npy",
-    "u_skycube": "textures/starfield/sky64k/sky64k.json"
+    "u_kntable": "textures/kerr_v7/kn_disk_table_r2_20.npy",
+    "u_skycube": "textures/starfield/gaia_cube_g117_max/gaia_cube.json",
+    "u_nebula": "textures/starfield/nebula_photo4.npy"
   },
   "fps": 30,
-  "static_texture_filters": {}
+  "static_texture_filters": {
+    "u_nebula": "linear_mip"
+  }
 }

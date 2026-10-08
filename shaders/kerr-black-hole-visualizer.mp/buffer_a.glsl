@@ -2,10 +2,12 @@
 //
 // Only the top-left STATE_W x STATE_H texels are written; everything else
 // returns 0. Self-wired on iChannel0 for frame-to-frame feedback.
-//   row 0  camera, audio levels (AGC, bass/mid/treble), gear phases, beat clock, meteors
+//   row 0  camera, audio levels (AGC, bass/mid/treble), gear phases, beat clock,
+//          meteors, per-star disk pass trackers (px 40 pulsar, 41 dwarf)
 //   row 1  cleaned band levels
-//   row 2  strike envelopes, then the major bodies per copy (xyz = position, w = radius)
-//   row 3  moons per copy (xyz = position, w = radius)
+//   row 2  strike envelopes, major bodies (xyz = position, w = radius);
+//          px 48.. the pulsar's distance samples around now (pass tracker)
+//   row 3  moons (xyz = position, w = radius); px 48.. the dwarf's samples
 // The image pass reads every body position from here and does no orbital math.
 
 float prevPhase(int g) {
@@ -83,6 +85,8 @@ void mainImage(out vec4 fragColor, in vec2 fragCoord) {
 
     if (ip.y == 0) {
         int px = ip.x;
+        if (px == STATE_KN_PX)     { fragColor = knPassTrack(tempoBeatCount(), 2); return; }
+        if (px == STATE_KN_PX + 1) { fragColor = knPassTrack(tempoBeatCount(), 3); return; }
         if (px > STATE_BEATCNT_PX && px >= PULSE_PX + PULSE_N) { fragColor = vec4(0.0); return; }
 
         if (px == 12) {
@@ -330,6 +334,11 @@ void mainImage(out vec4 fragColor, in vec2 fragCoord) {
 
     if (ip.y == 2) {
         int px = ip.x;
+        if (px >= KN_SAMP_PX) {
+            float cb = tempoBeatCount() + (float(px - KN_SAMP_PX) - 0.5 * float(KN_SAMP_N - 1)) * KN_SAMP_H;
+            fragColor = knSample(0, cb);
+            return;
+        }
 
         if (px < N_TARGETS) {
             float lvl   = texelFetch(iChannel0, ivec2(13 + px, 0), 0).r;
@@ -367,6 +376,11 @@ void mainImage(out vec4 fragColor, in vec2 fragCoord) {
         return;
     }
 
+    if (ip.x >= KN_SAMP_PX) {
+        float cb = tempoBeatCount() + (float(ip.x - KN_SAMP_PX) - 0.5 * float(KN_SAMP_N - 1)) * KN_SAMP_H;
+        fragColor = knSample(1, cb);
+        return;
+    }
     int mIdxAll = ip.x;
     int kc = mIdxAll / MOONS_PER_COPY;
     int m  = mIdxAll - kc * MOONS_PER_COPY;
