@@ -19,7 +19,9 @@ Usage:
 """
 
 import argparse
+import importlib.util
 import json
+import math
 import os
 import queue
 import subprocess
@@ -243,6 +245,168 @@ def normalize_mp_wiring(wiring):
     return wiring
 
 
+_COMPUTE_FORMATS = {   # GLSL image format -> (components, moderngl dtype)
+    "rgba32f": (4, "f4"), "rgba16f": (4, "f2"),
+    "rg32f": (2, "f4"), "rg16f": (2, "f2"),
+    "r32f": (1, "f4"), "r16f": (1, "f2"),
+}
+COMPUTE_EXPOSE_UNIT_START = 24
+COMPUTE_SCRATCH_UNIT_START = 40
+
+
+class ComputeStage:
+    """The generic compute stage, ported from shader-backdrop's renderer.py
+    (see that file's ComputeStage docstring for the full contract). Built from
+    manifest.json's optional "compute": {"script": "sim.py"} field. The shader
+    folder holds a Python step script (setup(api)/step(api, dt)) plus its .comp
+    kernels; this class supplies the plumbing: compiling kernels, allocating 3D
+    textures, binding images/samplers per dispatch, broadcasting per-frame
+    uniforms (via the caller's set_uniform loop, which includes these kernels in
+    `progs`), and exposing chosen textures to the buffer/Image passes as
+    ordinary samplers.
+
+    Offline difference from the live version: no GPU timing queries and no
+    boop/reset 'hand' input (there is no interactive input offline); canvas is
+    supplied through `api.inputs["canvas"]` and the module globals CANVAS_W/H.
+    """
+
+    def __init__(self, ctx, mp_dir, spec, feed_units=None):
+        self.ctx = ctx
+        self.dir = mp_dir
+        self.state = {}
+        self._kernels = []
+        self._textures = []
+        self._exposed = {}          # uniform -> [unit, texture]
+        self.inputs = {"boop": 0, "boop_xy": (0.0, 0.0), "reset": 0, "canvas": (0.0, 0.0)}
+        self._feed_units = feed_units or {}
+        self._render_progs = []
+        self._mp = None
+        common_path = os.path.join(mp_dir, "compute_common.glsl")
+        self._common = open(common_path).read() if os.path.isfile(common_path) else ""
+        script_path = os.path.join(mp_dir, spec["script"])
+        mod_spec = importlib.util.spec_from_file_location(
+            f"compute_{os.path.basename(mp_dir).replace('.', '_')}", script_path)
+        self._module = importlib.util.module_from_spec(mod_spec)
+        mod_spec.loader.exec_module(self._module)
+        self._module.setup(self)
+        nbytes = sum(math.prod(t.size) * t.components * (2 if t.dtype == "f2" else 4)
+                     for t in self._textures)
+        print(f"  compute stage: {script_path} ({len(self._kernels)} kernels, "
+              f"{len(self._textures)} textures, {nbytes / 2**20:.0f} MiB)")
+
+    # ---- script API ----
+    def kernel(self, file, variant=None, defines=None):
+        head = "#version 460\n"
+        if variant:
+            head += f"#define K_{variant} 1\n"
+        for k, v in (defines or {}).items():
+            head += f"#define {k} {v}\n"
+        src = head + self._common + "\n" + open(os.path.join(self.dir, file)).read()
+        prog = self.ctx.compute_shader(src)
+        for name in ("bands", "stems", "kickflat"):
+            if name in self._feed_units:
+                try:
+                    prog[name].value = self._feed_units[name]
+                except KeyError:
+                    pass
+        self._kernels.append(prog)
+        return prog
+
+    def texture3d(self, size, fmt):
+        comps, dtype = _COMPUTE_FORMATS[fmt]
+        t = self.ctx.texture3d(tuple(size), comps, dtype=dtype)
+        t.filter = (moderngl.LINEAR, moderngl.LINEAR)
+        t.repeat_x = t.repeat_y = t.repeat_z = False
+        self._textures.append(t)
+        return t
+
+    def texture2d(self, size, fmt, data=None, nearest=False, wrap=False):
+        comps, dtype = _COMPUTE_FORMATS[fmt]
+        t = self.ctx.texture(tuple(size), comps, data=data, dtype=dtype)
+        f = moderngl.NEAREST if nearest else moderngl.LINEAR
+        t.filter = (f, f)
+        t.repeat_x = t.repeat_y = wrap
+        self._textures.append(t)
+        return t
+
+    def run(self, kernel, groups, images=None, samplers=None, uniforms=None):
+        for binding, tex in (images or {}).items():
+            tex.bind_to_image(binding, read=True, write=True)
+        for i, (name, tex) in enumerate((samplers or {}).items()):
+            tex.use(location=COMPUTE_SCRATCH_UNIT_START + i)
+            try:
+                kernel[name].value = COMPUTE_SCRATCH_UNIT_START + i
+            except KeyError:
+                pass
+        self.set(kernel, uniforms or {})
+        kernel.run(*groups)
+        self.ctx.memory_barrier()
+
+    def set(self, kernel, uniforms):
+        for name, val in uniforms.items():
+            try:
+                kernel[name].value = val
+            except KeyError:
+                pass
+
+    def expose(self, uniform, tex):
+        if uniform not in self._exposed:
+            unit = COMPUTE_EXPOSE_UNIT_START + len(self._exposed)
+            self._exposed[uniform] = [unit, tex]
+            for p in self._render_progs:
+                try:
+                    p[uniform].value = unit
+                except KeyError:
+                    pass
+        self._exposed[uniform][1] = tex
+        tex.use(location=self._exposed[uniform][0])
+
+    def render_uniform(self, name, value):
+        for p in self._render_progs:
+            try:
+                p[name].value = value
+            except KeyError:
+                pass
+
+    def buffer(self, letter):
+        b = self._mp["buffers"][letter]
+        return b["tex"][b["cur"]]
+
+    # ---- renderer side ----
+    def attach(self, mp, render_progs):
+        self._mp = mp
+        self._render_progs = render_progs
+        for uniform, (unit, tex) in self._exposed.items():
+            tex.use(location=unit)
+            for p in render_progs:
+                try:
+                    p[uniform].value = unit
+                except KeyError:
+                    pass
+
+    def programs(self):
+        return self._kernels
+
+    def step(self, dt, now=None):
+        self._module.step(self, dt)
+        # the dispatches rebound units; restore what the render passes read
+        for unit, tex in self._exposed.values():
+            tex.use(location=unit)
+
+    def release(self):
+        for k in self._kernels:
+            k.release()
+        for t in self._textures:
+            t.release()
+
+
+def load_compute_stage(ctx, mp_dir, manifest, feed_units=None):
+    spec = manifest.get("compute")
+    if not spec or "script" not in spec:
+        return None
+    return ComputeStage(ctx, mp_dir, spec, feed_units)
+
+
 def load_multipass(ctx, vbo, mp_dir, width, height, dtype):
     """Buffer chain (buffer_a.glsl..buffer_d.glsl -> image.glsl), manifest-
     driven wiring -- same model as shader-backdrop's live renderer.py, ported
@@ -299,7 +463,13 @@ def load_multipass(ctx, vbo, mp_dir, width, height, dtype):
     image_prog = ctx.program(vertex_shader=VERT, fragment_shader=W.wrap(common_src + img_src))
     image_vao = ctx.vertex_array(image_prog, [(vbo, "2f", "in_vert")])
 
-    return {
+    compute = load_compute_stage(ctx, mp_dir, manifest)
+    all_progs = [b["prog"] for b in buffers.values()] + [image_prog]
+    if compute is not None:
+        # kernels get the same per-frame uniform broadcast as the render passes
+        all_progs += compute.programs()
+
+    mp = {
         "buffers": buffers,
         "image_prog": image_prog, "image_vao": image_vao,
         "image_wiring": wiring.get("Image", {}),
@@ -307,10 +477,14 @@ def load_multipass(ctx, vbo, mp_dir, width, height, dtype):
         "photo_textures": photo_textures,
         "ctx": ctx,
         "res": (width, height),
-        "all_progs": [b["prog"] for b in buffers.values()] + [image_prog],
+        "all_progs": all_progs,
+        "compute": compute,
         "dir": mp_dir,
         "manifest": manifest,
     }
+    if compute is not None:
+        compute.attach(mp, all_progs)
+    return mp
 
 
 def load_static_array_texture(ctx, path, mm, filter_mode=None):
@@ -510,7 +684,14 @@ def prepare_live_feed(ctx, mp, args, audio):
     bands/stems are rewritten per frame in write_live_feed()."""
     d = mp["dir"]
     uses = scan_mp_feed_uses(d)
-    static = mp["manifest"].get("static_textures", {})
+    static = dict(mp["manifest"].get("static_textures", {}))
+    # 2026-10-21 (orrery_kerr offline sky choice): STATIC_OVERRIDE="u_skycube=textures/starfield/sky64k/sky64k.json;..."
+    # swaps a manifest static texture for this render only (paths relative to --textures-root, like the manifest's).
+    for item in filter(None, os.environ.get("STATIC_OVERRIDE", "").split(";")):
+        name, _, path = item.partition("=")
+        if name.strip() and path.strip():
+            static[name.strip()] = path.strip()
+            print(f"  static override: {name.strip()} -> {path.strip()}")
     filters = mp["manifest"].get("static_texture_filters", {})
     feed = {"bands": None, "stems": None, "bands_tex": None, "stems_tex": None,
             "static_tex": [], "uses": uses}
@@ -730,6 +911,10 @@ def main(argv=None):
     ap.add_argument("--shader", required=True)
     ap.add_argument("--audio", help="audio file (any ffmpeg-readable format)")
     ap.add_argument("--features", help="pre-computed features.npz (skip analysis)")
+    ap.add_argument("--exact-audio", action="store_true",
+                    help="drive the shader from the exact offline replay of the live "
+                         "analysis chain (exact_audio.py) instead of features.py's "
+                         "approximation -- all u_* scalars, bands and stems")
     ap.add_argument("--fps", type=float, default=60.0)
     ap.add_argument("--width", type=int, default=1080)
     ap.add_argument("--height", type=int, default=2410)
@@ -822,6 +1007,12 @@ def main(argv=None):
         args.width, args.height = aw, ah
     args.hdr = not args.sdr
 
+    # The canvas size the shader-backdrop compute stage reads (sim.py's
+    # _canvas() pulls CANVAS_W/CANVAS_H off __main__, exactly as the live
+    # renderer provides them).
+    global CANVAS_W, CANVAS_H
+    CANVAS_W, CANVAS_H = int(args.width), int(args.height)
+
     feats_norm, num_frames, fps, beat = load_features(args.audio, args.features, args.fps)
     start_frame = int(round(args.start * fps))
     end_frame = num_frames if not args.frames else min(num_frames, start_frame + args.frames)
@@ -831,6 +1022,28 @@ def main(argv=None):
         raise SystemExit(f"--start {args.start}s is past the end of the track")
     print(f"frames={num_frames} (start={args.start}s) fps={fps} res={args.width}x{args.height} "
           f"{'HDR10' if args.hdr else 'SDR10'}")
+
+    # Optional exact offline audio replay (scope.md 2026-10-14): replaces the
+    # features.py approximation for the bands/stems textures and every u_*
+    # scalar with a block-for-block replay of the live analysis chain.
+    exact = None
+    if args.exact_audio:
+        if not args.audio:
+            raise SystemExit("--exact-audio needs --audio (the file to analyse)")
+        import exact_audio
+        song = exact_audio._lookup_song(args.audio)
+        print(f"  exact audio: analysing {os.path.basename(args.audio)} "
+              f"(song analysis: {'yes' if song else 'no -- live path for u_ms_*'})")
+        exact = exact_audio.analyze(args.audio, fps, song_npz=song)
+        print(f"  exact audio: {exact['num_frames']} frames")
+
+    # BEAT_FROM_ANALYSIS=<song analysis .npz>: drive u_beat_count from that analysis (see the frame loop)
+    beat_from_song = None
+    if os.environ.get("BEAT_FROM_ANALYSIS"):
+        sys.path.insert(0, F.backdrop_dir())
+        import song_features
+        beat_from_song = song_features.Song(os.environ["BEAT_FROM_ANALYSIS"])
+        print(f"  beat count from analysis: {os.path.basename(os.environ['BEAT_FROM_ANALYSIS'])}")
 
     idx = find_dgpu_index()
     if idx is None:
@@ -1002,8 +1215,40 @@ def main(argv=None):
                         prog["u_beat_conf"].value = 1.0
             if feed is not None:
                 write_live_feed(feed, start_frame + t)
+            if exact is not None:
+                # Exact bands/stems textures + every u_* scalar, straight from
+                # the offline replay of the live analysis chain. Runs after the
+                # features.py values above so it overrides them.
+                af = min(start_frame + t, exact["num_frames"] - 1)
+                if feed is not None:
+                    if feed["bands_tex"] is not None:
+                        feed["bands_tex"].write(
+                            np.ascontiguousarray(exact["bands"][af], dtype="f4").tobytes())
+                    if feed["stems_tex"] is not None:
+                        feed["stems_tex"].write(
+                            np.ascontiguousarray(exact["stems"][af], dtype="f4").tobytes())
+                for name, arr in exact["scalars"].items():
+                    val = (tuple(float(x) for x in arr[af]) if arr.ndim == 2
+                           else float(arr[af]))
+                    for prog in progs:
+                        try:
+                            prog[name].value = val
+                        except KeyError:
+                            pass
+            if beat_from_song is not None:
+                # 2026-10-21 (orrery_kerr director plans): u_beat_count = the SONG ANALYSIS's beat index at this frame's
+                # time -- the same numbering the plan was made with, so passes and camera swings land on the beat.
+                bc = float(beat_from_song.beat_index_at((start_frame + t) / fps))
+                for prog in progs:
+                    if "u_beat_count" in prog:
+                        prog["u_beat_count"].value = bc
             if _PHASE_LOG:
                 ctx.finish(); _ph_t = time.perf_counter()
+            if multipass and mp.get("compute") is not None:
+                # The sim's step runs BEFORE the render passes, so u_glow/u_worm
+                # are this frame's (same order as the live renderer).
+                mp["compute"].inputs["canvas"] = (float(args.width), float(args.height))
+                mp["compute"].step(1.0 / fps)
             if multipass:
                 render_multipass(mp, fbo_main)
             else:

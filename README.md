@@ -43,6 +43,42 @@ music-theory lattice of pitch classes) as a polar hex field seen from above. Ang
 up, and each hex pin rises with its band's loudness, so a chord shows up as
 the same shape repeated across octaves.
 
+**Tonnetz-Hex-Pins** (`shaders/tonnetz-hex-pins.mp`): the same lattice rebuilt
+as ruby crystal pins (refraction, total internal reflection, absorption; light
+walks from pin to pin), with chord tones outlined in green, an outer ring of
+pins for the drums, and two UV fairy lights that fly over it leaving trails.
+
+**Disnub-Diamond-Checker-Tunnel** (`shaders/disnub-diamond-checker-tunnel.mp`):
+the great disnub diamond in front of a checker tunnel instead of the window.
+
+**Ember-Flock-Metal-Pit** (`shaders/ember-flock-metal-pit.mp`, portrait
+canvas): two flocks of burning embers chasing hunter heads in a pit seen from
+above. The walls are black liquid metal that wrinkles where embers hit and
+reflects the flocks, and dense self-shadowed smoke rises toward you. The
+movement (pockets, figures, eye-catchers) is the phone version's choreography;
+its 18 steering knobs ship at the setting a live parameter search picked
+(`tune.py`, off by default). A phone pad can steer it (see "Controls").
+
+**Lagoon-Worms** and **Lagoon-Worms-Pad** (`shaders/lagoon-worms.mp`,
+`shaders/lagoon-worms-pad.mp`): two glowing worms in a compute fluid, mirrored
+through the centre, shedding goo that keeps the colour it was born with. On
+every section change one worm picks a new colour from a mood palette. The pad
+version is steered from a phone pad.
+
+### Phone wallpapers
+
+`phone/` holds four live wallpapers for the
+[ShaderEditor fork](https://github.com/marx161-cmd/ShaderEditor) (multi-pass
+and compute shaders, backdrop images; tuned for 120 fps on a Pixel 10 Pro):
+**emberbox** (the ember flocks in a glass tank; tap, swipe, hold, tilt, back
+tap), **worms-glass** (the lagoon worms in a 64³ fluid; tap knocks a jet, swipe
+slices, hold calls the pair, two fingers make a ring, three fingers cycle
+colours), **dwarf-diorama** (a brown dwarf with its ring and moons in a glass
+box) and **dwarf-ships** (the diorama with two ships that shoot from the star's
+beams, rescue loose moons and farm the ring). Copy them to Termux's
+`~/shaders/` and the wall images (`python3 download_data.py phone`) to
+`~/shaders/backdrops/`.
+
 ## How it fits together
 
 ```
@@ -55,8 +91,9 @@ track file ──> video/render_video.py (same band analysis, offline) ───
   EasyEffects with a native band analyser: 120 semitone-spaced band-pass
   filters (27.5 Hz to 28 kHz), published to `/dev/shm/shader_bands` for
   any program to read. The renderer reads it via `shared_bands.py`.
-- **`renderer.py`**: draws the active shader into one square 2410×2410
-  canvas and shows each connected monitor its crop of it, as an
+- **`renderer.py`**: draws the active shader into one canvas (square
+  2410×2410 unless the shader's `manifest.json` asks for another) and shows
+  each connected monitor its crop of it, as an
   override-redirect window below everything else (a wallpaper). Shaders
   hot-reload on save; `active_shader.txt` picks the shader (the patched
   EasyEffects has a picker for it).
@@ -70,7 +107,7 @@ track file ──> video/render_video.py (same band analysis, offline) ───
 - The patched EasyEffects from [easyeffects-shader-bands](https://github.com/marx161-cmd/easyeffects-shader-bands)
 - An OpenGL 3.3 GPU. VRAM: the Kerr shader keeps about 6.6 GB of tables on
   the GPU (plan for 8 GB free), the Nebulabrot about 9 GB (realistically a 16 GB
-  card), the diamonds and the Tonnetz almost none.
+  card), the rest well under 1 GB.
 - Python 3.11+, `playerctl` (optional: per-song beat maps), ffmpeg with
   `av1_vaapi` for the video pipeline
 
@@ -80,7 +117,7 @@ track file ──> video/render_video.py (same band analysis, offline) ───
 git clone https://github.com/marx161-cmd/audio-reactive-shaders ~/audio-reactive-shaders
 cd ~/audio-reactive-shaders
 python3 -m venv .venv && .venv/bin/pip install -r requirements.txt
-python3 download_data.py            # all data, ~16 GB; or pick: kerr | nebulabrot | diamonds
+python3 download_data.py            # all data, ~16 GB; or pick groups, see --help
 cp config.example.toml config.toml  # optional: audio delay, which monitors
 echo kerr-black-hole-visualizer.mp > active_shader.txt
 .venv/bin/python3 renderer.py
@@ -101,6 +138,14 @@ dir=~/audio-reactive-shaders
 
 The backdrop never takes keyboard focus. Bind `contrib/orrery-cam`
 (`up|down|left|right|in|out|reset`) to window-manager keys to move the camera.
+
+Lagoon-Worms-Pad and Ember-Flock-Metal-Pit read a phone pad: the
+[DroidPad](https://github.com/umer0586/DroidPad) app sends its widgets over
+MQTT, `contrib/droidpad-shader-bridge` (needs `paho-mqtt` and a broker such as
+mosquitto) writes them to `pad.json`, and the renderer reads that. Import the
+matching profile from `contrib/pads/` (`mycontrolpad-2.json` for the worms,
+`ember.json` for the embers) into DroidPad and set your broker's address (the
+files say `YOUR_BROKER_IP`).
 
 For the Nebulabrot, bind `tools/dive.py next`, `tools/dive.py prev` and
 `tools/dive.py auto toggle`. `tools/dive.py add` saves the current view as a
@@ -159,12 +204,14 @@ bake for zeroed samples before using it.
 - Milky Way: ESO/S. Brunier, eso0932a (CC BY 4.0), edited (stars removed, recoloured).
 - Southern Ring Nebula (NGC 3132) and Helix Nebula (NGC 7293): ESA (CC BY 4.0),
   edited (stars removed), placed on the sky map.
-- Stained-glass window and the diamond's portal picture: the author's own images.
+- Stained-glass windows (including the ember pit and the phone glass boxes),
+  the diamond's portal picture and the checker tunnel: the author's own images.
 - Older star map (still in the dataset): NASA/Goddard Space Flight Center
   Scientific Visualization Studio, *Deep Star Maps 2020*.
 - Sun and Saturn textures (and the ring alpha): [Solar System Scope](https://www.solarsystemscope.com/textures/), CC BY 4.0.
 - Chromosphere: NASA STEREO/EUVI + SDO/AIA 304 Å Carrington map.
 - Moon surface: NASA LRO / LROC.
+- Liquid-metal walls of the ember pit: after mrange's *Liquid Metal* (Shadertoy 3t2czh, CC0).
 
 ## License
 

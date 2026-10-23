@@ -53,8 +53,13 @@ from Xlib.display import Display
 sys.path.insert(0, os.path.dirname(__file__))
 from shared_bands import BandsReader, N_BANDS
 import beat_session
+import music_state
+import song_replay
+import held_tone
 import beat_track
 import stem_split
+import kick_detect
+import band_filters
 from audio_texture import AudioTexReader, WIDTH as AUDIO_TEX_WIDTH
 import importlib.util
 
@@ -223,6 +228,190 @@ FREEFLY_KEYS = ("yaw", "pitch", "roll", "r", "u", "f")
 # Treated as released when the file goes stale (relay died mid-hold).
 GYRO_FILE = os.path.join(os.path.dirname(__file__), "gyro_state.txt")
 GYRO_STALE_S = 1.0
+# 2026-10-15: the DroidPad control surface on the Pixel (com.github.umer0586.droidpad
+# -> MQTT -> ~/bin/droidpad-shader-bridge -> this file). Same hot-read convention as
+# the state files above. The bridge writes the raw widgets plus MONOTONIC event
+# counters (the renderer only samples at frame rate, so counting happens where every
+# MQTT message is seen); we diff the counters per frame and publish the whole surface
+# as u_pad_* uniforms for a shader to steer itself with. Nothing here overrides the
+# shader -- these are forces/bias/pressed-edges, and the shader decides. Treated as
+# gone (u_pad_alive 0) when the file goes stale, so shaders fall back to their own
+# motion rather than freezing on the last command.
+PAD_FILE = os.path.join(os.path.dirname(__file__), "pad.json")
+PAD_STALE_S = 3.0
+# 2026-10-17 PERISCOPE (scope.md "PERISCOPE mode"): ~/bin/periscope-stream writes the Pixel's fused orientation here
+# ("unix_t qx qy qz qw", Android world frame, phone -> world) while the pad's "Periscope" switch is ON. The free camera
+# then follows the phone 1:1 as a full 3-axis window (camera forward = out of the phone's back), relative to the pose at
+# engage. Stale (no sample for PERISCOPE_STALE_S) = released; the sticks take over again.
+PERISCOPE_FILE = os.path.join(os.path.dirname(__file__), "periscope_state.txt")
+PERISCOPE_STALE_S = 0.5
+
+
+def read_periscope():
+    """-> the phone's xyzw quaternion, or None if missing/stale."""
+    try:
+        with open(PERISCOPE_FILE) as fh:
+            v = [float(x) for x in fh.read().split()]
+        if len(v) != 5 or time.time() - v[0] > PERISCOPE_STALE_S:
+            return None
+        n = math.sqrt(sum(c * c for c in v[1:])) or 1.0
+        return tuple(c / n for c in v[1:])
+    except (OSError, ValueError):
+        return None
+
+
+def periscope_rel_cam(q0, q):
+    """The phone's turn since engage (in its own frame), re-expressed in camera space. The phone frame is x right,
+    y up the screen, z OUT of the screen; the camera is x right, y up, z forward = out of the phone's BACK, i.e. the
+    phone frame mirrored in z. Conjugating a rotation by that mirror maps quaternion (x, y, z, w) -> (-x, -y, z, w)."""
+    r = quat_mul((-q0[0], -q0[1], -q0[2], q0[3]), q)
+    return (-r[0], -r[1], r[2], r[3])
+PAD_SEP_STEP = 0.05          # per dpad click, the figures' separation nudge
+# 2026-10-17 XBOX CONTROLLER (scope.md "NEW shader fishbox.mp"): ~/bin/xpad-shader-bridge reads the Elite
+# controller over evdev and writes gamepad.json (sticks -1..1 in evdev sign, triggers 0..1, held buttons,
+# monotonic press counters). Same hot-read contract as pad.json, but its OWN namespace: published as u_xb_*
+# and nothing else -- the phone pads never see the controller and no shader but the one that asks reads it
+# (pads/README.md "two namespaces"). Stale = controller gone -> u_xb_alive 0, the shader runs its own dance.
+GAMEPAD_FILE = os.path.join(os.path.dirname(__file__), "gamepad.json")
+XB_STALE_S = 3.0             # the bridge heartbeats once a second
+XB_DEADZONE = 0.12           # stick slop around centre (the Elite's sticks rest a few % off)
+XB_STICK_Y_UP = -1.0         # evdev reports +y = DOWN; the one place to flip "stick up = up"
+# THE LAYER MAP (user: strict split -- left paddles / LT / LB belong to the LEFT stick = flock 0, right side
+# = flock 1). The paddles arrive as the face buttons the controller's profile maps them to, so which face
+# button is which paddle is a per-profile fact: remap HERE, live, on first test (user: "remap is sth we
+# should be testing"). Layer 0 = none (MOVE), 1 = upper paddle (AXIS), 2 = lower paddle (SHAPE).
+XB_LAYER_MAP = {"left": {"upper": "ls", "lower": "b"},    # read off the bridge log 2026-10-17 11:42 (this profile:
+                "right": {"upper": "rs", "lower": "x"}}   #  the paddles send stick clicks + B / X)
+# ... and the SAME shape in gamepad_map.json next to this file OVERRIDES it, hot-read (mtime), so a remap is an
+# edit to that file, not a renderer restart: {"left": {"upper": "ls", "lower": "b"}, "right": {...}}
+GAMEPAD_MAP_FILE = os.path.join(os.path.dirname(__file__), "gamepad_map.json")
+
+# ---- PAD FLIGHT + CROSSHAIR (2026-10-15, user: "maybe we can actually add 3d camera
+# flight", "it should fling whatever comes into crosshair since orbits are hard to hit")
+# The pad's own free-fly, in the same shape as the mouse one: a HELD stick deflection is
+# a RATE, so letting go parks the framing where you left it instead of swimming it back.
+# Values are per second so the feel is framerate-independent.
+PAD_CAM_LOOK_RATE = 0.9      # rad/s at full stick: how fast the Look stick swings the view
+PAD_CAM_MOVE_RATE = 3.0      # world units/s at full stick (brown dwarf: 1.0 = the dwarf's radius)
+PAD_CAM_DEADZONE = 0.10      # stick slop around centre, in stick units (-1..1)
+PAD_BOOP_DEADZONE = 0.12     # crosshair stick: under this the reticle is parked and uncatches
+# The general remote's one safety cap. The pad's Look/Move sticks also drive the SHARED
+# hand camera (see the pad block in the render loop), whose pose is GLOBAL and PERSISTED
+# (freefly_state.txt): one long frame -- a shader reload, an output-layout change -- with a
+# stick held would otherwise turn one frame into one huge fling of every flying shader's
+# framing, and leave it there. 0.10 s is far above a 120 fps frame and far below a reload.
+PAD_STEER_DT_MAX = 0.10      # s: most sim-time one held stick may contribute per frame
+# Spring-return controls go back to rest on their own -- but only if they hear about it. The app
+# sends a JOYSTICK's value on movement and a 0 on drag END, so a release that never arrives (a pad
+# switched mid-drag, an app backgrounded, one QoS-0 message lost) leaves the last deflection
+# latched, and the bridge's heartbeat then keeps it alive forever. A widget nobody has refreshed
+# for this long therefore reads as its RESTING value (0), for sticks and for the wheel; sliders and
+# switches are NOT spring-return and keep their value indefinitely. Generous on purpose: a finger
+# resting dead still on glass still jitters, so a genuine hold keeps re-stamping itself.
+PAD_STICK_TTL_S = 8.0        # s without any event before a spring-return widget reads as rest
+# The general pad's STEERING_WHEEL is the one camera axis no stick can reach (roll). Its event is
+# an ABSOLUTE angle in degrees (the app animates a released wheel back to 0), so it is applied as a
+# DELTA and the phone's own self-centring unwinds it -- see the pad block. Full lock (360) is about
+# 69 degrees of roll, which is enough to lay the horizon right over without losing the scene.
+PAD_WHEEL_ROLL_SENS = 1.2 / 360.0
+# 2026-10-16: the wheel now also rolls the free camera (u_pad_cam_q, see the wheel block). view_quat
+# applies its roll as Rz(-roll), which is the window-cal convention; this is the one place to flip if
+# tilting the phone's right edge down rolls the horizon the wrong way.
+PHONE_ROLL_SIGN = 1.0
+# The ONE place to flip every stick if a control feels inverted. DroidPad plots a
+# joystick in screen coordinates, so a stick pushed "up" can arrive as -y; +1 here means
+# "a joystick's +y is UP" (pitch up, fly forward, reticle up the canvas).
+PAD_STICK_Y_UP = 1.0
+
+
+def pad_xy(widgets, wid, now=None):
+    """A JOYSTICK's deflection, or (0, 0) when it has gone quiet.
+
+    Spring-return widgets have no "released" state on the wire -- only a 0 event that may
+    never arrive (see PAD_STICK_TTL_S) -- so pass `now` and an unrefreshed stick reads as
+    the centre it would have sprung back to. Sliders/switches keep their value: pad_val
+    and pad_sw are untouched by any of this."""
+    v = widgets.get(wid) or {}
+    if now is not None and now - float(v.get("t", 0.0)) > PAD_STICK_TTL_S:
+        return (0.0, 0.0)
+    return (float(v.get("x", 0.0)), float(v.get("y", 0.0)))
+
+
+def pad_val(widgets, wid):
+    return float((widgets.get(wid) or {}).get("value", 0.0))
+
+
+def pad_sw(widgets, wid):
+    return 1.0 if (widgets.get(wid) or {}).get("state") else 0.0
+
+
+PAD_ALIASES = {"farming off": "ring_farm_off", "cam NORMAL/PORTRAIT": "cam_mode",
+               "cam NORMAL/PORTRAIT/SHIP A/SHIP B/ON C": "cam_mode",   # 2026-10-23: 5-stop cam slider
+               "NORMAL/SLINGSHOT/ROSETTE": "sys_mode", "Star WHITE/YELLOW/RED": "star_colour",
+               "mouse OFF/BOOP/GRAB": "Mouse", "STAR SLING": "Dwarf Big Shock", "MOON": "refill"}
+
+
+def pad_val_opt(widgets, wid):
+    """A slider's value, or None when the pad has never sent that widget (2026-10-22, ringbox step sliders)."""
+    w = widgets.get(wid) or {}
+    v = w.get("value")
+    return None if v is None else float(v)
+
+
+# ---- REMOTE VARIANTS (2026-10-15) --------------------------------------------------
+# A shader and its remote-only sibling are a name pair: "<x>.mp" <-> "ctrl_<x>.mp". The
+# pad's "off" switch picks which half is active by writing active_shader.txt (see the
+# pad block in the render loop). These helpers are deliberately dumb: they only ever
+# swap between an existing pair, and never invent a name.
+# ---- LEAN UNIFORMS (2026-10-19, user: "we skip every file check and setting copy that is not mandatory"): every uniform
+# write goes through uset(). It remembers each program's uniform object (or that the program has none -- GLSL drops unused
+# ones, and the old code paid a raised+caught KeyError for that every frame) and skips a write whose value did not change.
+# Entries hold the program itself and are only trusted while `entry[0] is p`, so a reloaded program never inherits them.
+class _SkipCheck(Exception):
+    pass
+
+
+_UCACHE = {}
+_MISSING = object()
+
+
+def uset(p, name, value):
+    # (2026-10-19: a cached / skip-unchanged version was MEASURED slower -- 24 % vs 12 % of the main thread -- because the
+    #  audio thread shares the GIL and more Python steps = more forced switches. So: the original direct write.)
+    try:
+        p[name].value = value
+    except KeyError:
+        pass
+
+
+def read_active_shader_name():
+    try:
+        with open(ACTIVE_SHADER_FILE) as f:
+            return f.read().strip()
+    except OSError:
+        return ""
+
+
+def write_active_shader_name(name):
+    tmp = ACTIVE_SHADER_FILE + ".tmp"
+    with open(tmp, "w") as fh:
+        fh.write(name + "\n")
+    os.replace(tmp, ACTIVE_SHADER_FILE)
+
+
+def shader_pair(name):
+    """(auto_name, ctrl_name) for a shader that has a ctrl_ sibling, else None.
+
+    Both halves must exist as real .mp dirs (manifest.json present), so a lone shader
+    has no remote variant and the trigger stays inert on it."""
+    if not name or not name.endswith(".mp"):
+        return None
+    base = name[len("ctrl_"):] if name.startswith("ctrl_") else name
+    pair = (base, "ctrl_" + base)
+    for n in pair:
+        if not os.path.isfile(os.path.join(SHADER_DIR, n, "manifest.json")):
+            return None
+    return pair
 # 2026-09-23: full-canvas video capture (scope.md "Music-session video capture").
 # Same polled-state-file convention as the files above. Written by
 # capture_session.py, which watches MPRIS; the recording itself lives in
@@ -307,6 +496,104 @@ def save_freefly(cam):
         os.replace(tmp, FREEFLY_FILE)
     except OSError:
         pass
+
+
+# 2026-10-15 (scope.md "SIDE VIEW"): WINDOWS. A head can look at the SAME world from a fixed offset in
+# the ship's frame -- like a ship's window. The ship (the shader's own camera: orbit, buffer-A
+# quaternion, u_cam_look ...) is never touched here; a window is just a fixed rotation + field-of-view
+# scale handed to the Image pass as `u_view_q` (xyzw quaternion, rotates the camera-space ray) and
+# `u_view_fov` (uv scale). The front/default view is the identity, so shaders that do not declare
+# them, and heads without a window entry, are byte-for-byte unchanged. Buffers and compute run once;
+# only the Image pass runs again per window, into that head's own texture.
+#
+# windows.json (hot-reloaded; edited by tools/window-cal):
+#   {"windows": [{"match": {"primary": true}, "yaw": -60, "pitch": 0, "roll": 0, "zoom": 1.0,
+#                 "locked": false}]}
+# match: "primary" (the vsync head), "index" (OUTPUTS order), "size" ("1920x1080" -- survives the xrandr
+# name drift when monitors are rearranged) or "name" (xrandr name, drifts!). An entry with yaw/pitch/roll 0
+# is a pure per-head ZOOM. zoom 2 = twice as magnified.
+# Degrees; yaw+ looks RIGHT, pitch+ looks UP, roll+ is clockwise as seen by the viewer. "enabled":
+# false turns an entry off; "locked" is honoured by tools/window-cal (the renderer reads values only).
+WINDOWS_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "windows.json")
+VIEW_IDENTITY = (0.0, 0.0, 0.0, 1.0)
+
+
+def view_quat(yaw_deg, pitch_deg, roll_deg):
+    """xyzw quaternion of R = Ry(yaw) * Rx(-pitch) * Rz(-roll), camera space x right, y up, z forward."""
+    def axis_q(ax, ang):
+        s, c = math.sin(ang / 2.0), math.cos(ang / 2.0)
+        return (ax[0] * s, ax[1] * s, ax[2] * s, c)
+
+    def mul(a, b):
+        ax, ay, az, aw = a
+        bx, by, bz, bw = b
+        return (aw * bx + ax * bw + ay * bz - az * by,
+                aw * by - ax * bz + ay * bw + az * bx,
+                aw * bz + ax * by - ay * bx + az * bw,
+                aw * bw - ax * bx - ay * by - az * bz)
+    q = mul(mul(axis_q((0, 1, 0), math.radians(yaw_deg)),
+                axis_q((1, 0, 0), -math.radians(pitch_deg))),
+            axis_q((0, 0, 1), -math.radians(roll_deg)))
+    n = math.sqrt(sum(v * v for v in q)) or 1.0
+    return tuple(v / n for v in q)
+
+
+def quat_mul(a, b):
+    ax, ay, az, aw = a
+    bx, by, bz, bw = b
+    return (aw * bx + ax * bw + ay * bz - az * by,
+            aw * by - ax * bz + ay * bw + az * bx,
+            aw * bz + ax * by - ay * bx + az * bw,
+            aw * bw - ax * bx - ay * by - az * bz)
+
+
+def quat_rot(q, v):
+    """Rotate v by xyzw q -- the same formula as the shaders' viewRot()."""
+    x, y, z, w = q
+    cx = (y * v[2] - z * v[1], z * v[0] - x * v[2], x * v[1] - y * v[0])
+    t = (cx[0] + w * v[0], cx[1] + w * v[1], cx[2] + w * v[2])
+    c2 = (y * t[2] - z * t[1], z * t[0] - x * t[2], x * t[1] - y * t[0])
+    return (v[0] + 2 * c2[0], v[1] + 2 * c2[1], v[2] + 2 * c2[2])
+
+
+def load_windows(prev_mtime):
+    """-> (mtime, entries|None). None entries = unchanged since prev_mtime. A bad file keeps the old
+    state (returns the new mtime with entries=None) rather than dropping every window mid-calibration."""
+    try:
+        m = os.path.getmtime(WINDOWS_FILE)
+    except OSError:
+        return (None, []) if prev_mtime is not None else (None, None)
+    if m == prev_mtime:
+        return m, None
+    try:
+        with open(WINDOWS_FILE) as fh:
+            raw = json.load(fh).get("windows", [])
+        out = []
+        for e in raw:
+            if not e.get("enabled", True):
+                continue
+            out.append({
+                "match": dict(e.get("match", {})),
+                "q": view_quat(float(e.get("yaw", 0.0)), float(e.get("pitch", 0.0)), float(e.get("roll", 0.0))),
+                # zoom 2 = twice as magnified (the ray's uv scale is its inverse). "fov" = the old key (uv scale).
+                "fov": 1.0 / max(0.05, float(e["zoom"])) if "zoom" in e else max(0.05, float(e.get("fov", 1.0))),
+            })
+        return m, out
+    except (OSError, ValueError, TypeError, AttributeError) as ex:
+        print(f"windows: {WINDOWS_FILE} unreadable ({ex}); keeping previous", file=sys.stderr)
+        return m, None
+
+
+def window_for(entries, idx, spec):
+    for e in entries:
+        mt = e["match"]
+        if (mt.get("primary") and idx == 0) or mt.get("index") == idx or \
+                (mt.get("name") and mt["name"] == spec["name"]) or \
+                (mt.get("size") and mt["size"] == "%dx%d" % (spec["w"], spec["h"])):
+            return e
+    return None
+
+
 CAMERA_DEFAULT = (0.58, 0.35, 1.0)
 
 # Hold-to-steer key. While this key is physically held, the shader may use
@@ -368,6 +655,48 @@ def resolve_active_shader_path():
 
 
 SHADER_PATH = resolve_active_shader_path()
+
+# Canvas size is declared BY the shader, not derived from the outputs (see the
+# CANVAS block below for why it is not read off xrandr). Same shape as the fps
+# directive: multipass `"canvas": [W, H]` in manifest.json, single-pass a
+# `// canvas: WxH` line anywhere in the first 40 lines. Omitted -> the square
+# default, so nothing existing changes. Orientation is free: landscape,
+# portrait or square are all fine, and the blit quarter-turns per output only
+# when the output's orientation differs from the canvas's (crop_for_spec /
+# BLIT_FRAG) -- so a square canvas never rotates on any head.
+#
+# Read ONCE at startup: canvas_tex / canvas_fbo and the multipass buffers are
+# allocated from it below, so changing the declaration needs a renderer restart
+# (the ctl `start`), like any other Python-side change. try_reload() prints a
+# loud "restart required" if a hot-reloaded shader declares a different one.
+_CANVAS_DIRECTIVE_RE = re.compile(
+    r"^\s*//\s*canvas\s*:\s*(?P<w>\d+)\s*[xX]\s*(?P<h>\d+)\s*$"
+)
+DEFAULT_CANVAS_W = 2410
+DEFAULT_CANVAS_H = 2410
+
+
+def read_shader_canvas(path):
+    """(w, h) the active shader declares, else the square default."""
+    try:
+        if is_multipass_path(path):
+            with open(os.path.join(path, "manifest.json")) as f:
+                value = json.load(f).get("canvas")
+            if value and len(value) == 2:
+                return max(1, int(value[0])), max(1, int(value[1]))
+        else:
+            with open(path) as f:
+                for _ in range(40):
+                    line = f.readline()
+                    if not line:
+                        break
+                    m = _CANVAS_DIRECTIVE_RE.match(line)
+                    if m:
+                        return max(1, int(m.group("w"))), max(1, int(m.group("h")))
+    except Exception as e:
+        print(f"read_shader_canvas({path}): {e}; using default canvas", file=sys.stderr)
+    return DEFAULT_CANVAS_W, DEFAULT_CANVAS_H
+
 
 # Output geometry, read live from `xrandr --query` at startup and re-read by
 # sync_layout() -- never hardcoded (a hardcoded snapshot silently went stale
@@ -444,10 +773,11 @@ def detect_outputs():
     } for m in found]
 
 
-# Canvas = FIXED 2856x2856. Square, and deliberately NOT derived from the
-# detected outputs -- see HANDOFF.md item 2 for the render/blit spec (one real
-# render at this size, cheap centered-crop blit to each window, NOT three
-# independent full-resolution renders).
+# Canvas = FIXED size, and deliberately NOT derived from the detected outputs
+# -- see HANDOFF.md item 2 for the render/blit spec (one real render at this
+# size, cheap centered-crop blit to each window, NOT three independent
+# full-resolution renders). Default is the square 2410x2410 below; since
+# 2026-10-15 the shader may declare its own instead (read_shader_canvas).
 #
 # It used to be computed as max(width) x max(height) over whatever xrandr
 # reported. That is why the backdrop had to be restarted by hand every time
@@ -458,7 +788,10 @@ def detect_outputs():
 # Square because the outputs are in mixed orientations (2856x1280 landscape,
 # 1080x1920 portrait). A non-square canvas makes composition depend on WHICH
 # output is cropping it; a square one crops identically either way, so
-# "fills the frame" means the same thing on every screen.
+# "fills the frame" means the same thing on every screen. Still the default and
+# still the safest choice for that reason. 2026-10-15: a shader may now declare
+# a non-square (portrait) canvas instead -- the quarter-turn in crop_for_spec /
+# BLIT_FRAG is what makes that safe again on landscape heads.
 # 2026-09-20: 2856 -> 2410. Cost is almost exactly linear in pixel count for
 # these raymarchers (measured: 71.2% of the pixels costs 72-73% of the time),
 # so this is ~29% off every shader's frame cost -- a far bigger lever than any
@@ -471,33 +804,73 @@ def detect_outputs():
 # and scales that up wholesale, uniformly. Since 2026-09-27 the same rule
 # covers every head (canvas_per_screen: long side = full canvas), so the two
 # Dell appliance heads are downscaled ~0.8x instead of taking a 1:1 crop.
-CANVAS_W = 2410
-CANVAS_H = 2410
+CANVAS_W, CANVAS_H = read_shader_canvas(SHADER_PATH)
+# 2026-10-15 (user): a NON-SQUARE canvas is a PORTRAIT canvas, always -- the
+# mouse/reference space is portrait, and aspect is the one portrait shape the
+# shader declared. A landscape digit order is normalised to portrait here (and
+# logged), so declaring `// canvas: 2410x1080` and `// canvas: 1080x2410` mean
+# the same portrait canvas and the cursor can never end up in a landscape
+# frame. A SQUARE canvas is left exactly as today: nothing rotates, every head
+# fits by design. Landscape heads quarter-turn a portrait canvas (crop_for_spec
+# / BLIT_FRAG); square never rotates anywhere, so the default is unchanged.
+if CANVAS_W != CANVAS_H and CANVAS_W > CANVAS_H:
+    print(f"canvas: declared {CANVAS_W}x{CANVAS_H} normalised to portrait "
+          f"{CANVAS_H}x{CANVAS_W} (non-square canvas is always portrait)",
+          file=sys.stderr)
+    CANVAS_W, CANVAS_H = CANVAS_H, CANVAS_W
+
+
+def canvas_portrait():
+    """True for a non-square (portrait) canvas -- the case that quarter-turns
+    landscape heads. A square canvas is False everywhere, so it never rotates.
+    """
+    return CANVAS_W != CANVAS_H
 
 
 def canvas_per_screen(spec):
-    """Canvas pixels per screen pixel for this output -- ONE uniform factor.
+    """Canvas px per output px -- ONE uniform factor, a COVER scale: the canvas
+    always fills this output, cropping the excess (never letterboxing).
 
     2026-09-27 (user): every output's LONG side spans the full canvas, the
-    short side is a centred crop. The canvas is square because the Pixel
-    rotates (portrait/landscape) and the Dells are one of each, so "long side
-    = whole canvas" is the one rule that treats them all alike. Heads smaller
-    than the canvas are downscaled (the blit supersamples), bigger ones
-    upscaled. Before this, heads that fit took a 1:1 centre crop, so the Dells
-    showed only 45% x 80% of what was rendered.
+    short side is a centred crop. Heads smaller than the canvas are downscaled
+    (the blit supersamples), bigger ones upscaled. For the square default
+    canvas the long-side rule below and cover-fit are the same thing, so this
+    is unchanged for every existing shader. For a non-square canvas only cover
+    is correct (long-side fit can under-fill and would stretch); the rotated
+    case swaps which canvas axis lines up with the output's width.
     """
-    return CANVAS_W / max(spec["w"], spec["h"])
+    if output_rotated(spec):
+        return min(CANVAS_H / spec["w"], CANVAS_W / spec["h"])
+    return min(CANVAS_W / spec["w"], CANVAS_H / spec["h"])
+
+
+def output_rotated(spec):
+    """True when this output's orientation is perpendicular to the canvas's, so
+    the blit must quarter-turn it. Square canvas -> always False (canonical
+    case, unchanged). Portrait canvas -> True only on landscape heads.
+    """
+    if not canvas_portrait():
+        return False
+    return spec["w"] > spec["h"]
 
 
 def crop_for_spec(spec):
-    """UV offset+scale for blitting this output's share of the shared canvas
-    (see canvas_per_screen: long side = full canvas, uniform scale, centred).
-    Used by presenter setup and sync_layout, which must agree.
+    """UV offset+scale (+ quarter-turn flag) for blitting this output's share of
+    the shared canvas (see canvas_per_screen: long side = full canvas, uniform
+    scale, centred). Used by presenter setup and sync_layout, which must agree.
+
+    Third return value: rotate -- 1.0 when the blit must quarter-turn the canvas
+    for this head (a portrait canvas on a landscape head). The axes that map to
+    the output's w/h swap when rotated, which is what the span_u/span_v swap
+    below expresses; BLIT_FRAG does the actual 90 deg turn of the sample coords.
     """
     k = canvas_per_screen(spec)
-    uscale = min(1.0, (spec["w"] * k) / CANVAS_W)
-    vscale = min(1.0, (spec["h"] * k) / CANVAS_H)
-    return ((1.0 - uscale) / 2.0, (1.0 - vscale) / 2.0), (uscale, vscale)
+    rot = output_rotated(spec)
+    span_u = spec["h"] * k if rot else spec["w"] * k
+    span_v = spec["w"] * k if rot else spec["h"] * k
+    uscale = min(1.0, span_u / CANVAS_W)
+    vscale = min(1.0, span_v / CANVAS_H)
+    return ((1.0 - uscale) / 2.0, (1.0 - vscale) / 2.0), (uscale, vscale), (1.0 if rot else 0.0)
 
 OUTPUTS = detect_outputs()
 
@@ -516,6 +889,7 @@ BLIT_FRAG = """
 uniform sampler2D src_tex;
 uniform vec2 uv_offset;
 uniform vec2 uv_scale;
+uniform float uv_rot;   // 1.0 = quarter-turn the canvas for this head
 uniform vec2 tap;       // a quarter output pixel, in canvas uv: 4-tap supersample
 in vec2 v_uv;
 out vec4 fragColor;
@@ -523,7 +897,12 @@ void main() {
     // 4 taps per output pixel: heads smaller than the canvas are DOWNscaled
     // (~0.8x for the Dells), and a single bilinear tap would skip texels, so
     // fine detail (star fields) would shimmer.
-    vec2 uv = uv_offset + v_uv * uv_scale;
+    // uv_rot: a portrait canvas on a landscape head -- rotate the sample coords
+    // a quarter turn so the canvas long side lands on the output long side.
+    // The 4-tap cross is symmetric, so it needs no rotation of its own.
+    vec2 tuv = v_uv;
+    if (uv_rot > 0.5) tuv = vec2(tuv.y, 1.0 - tuv.x);
+    vec2 uv = uv_offset + tuv * uv_scale;
     vec4 col = 0.25 * (texture(src_tex, uv + vec2(-tap.x, -tap.y)) + texture(src_tex, uv + vec2(tap.x, -tap.y))
                      + texture(src_tex, uv + vec2(-tap.x, tap.y)) + texture(src_tex, uv + vec2(tap.x, tap.y)));
     // canvas_tex (every shader's render target) is 8-bit with no dtype
@@ -1129,6 +1508,11 @@ EXTRA_STATIC_TEXTURE_UNIT_START = 9
 # NEAREST filtering, because rows are discrete channels -- interpolating
 # between "drums" and "bass" is meaningless.
 STEMS_UNIT = 7
+# Kick flatten weights, 2026-10-08 (scope.md "kick-only flattening",
+# kick_detect.py): a 120x1 float texture `kickflat`, per band 0..1 = how much
+# of that band is kick at the drawn frame (look-ahead classified). Own sampler
+# like `stems`, so shaders that don't declare it are unaffected. NEAREST.
+KICK_UNIT = 6
 STEM_ROWS = 4
 
 # manifest.json's optional "compute" field (2026-10-02, scope.md "fluid ball"):
@@ -1156,6 +1540,7 @@ COMPUTE_TIMING_PERIOD = 10.0
 # full 188 Hz block rate would burn CPU to change almost nothing. 60 Hz is
 # already faster than any shader currently presents.
 STEM_UPDATE_PERIOD = 1.0 / 60.0
+AUDIO_IDLE_S = 0.5           # no NEW audio frame for this long = nothing playing -> music.idle() (synthetic clock)
 
 
 _GL_CUBE = None
@@ -1263,6 +1648,9 @@ class ComputeStage:
         self._kernels = []
         self._textures = []
         self._exposed = {}          # uniform -> [unit, texture]
+        # 2026-10-12 THE HAND (scope.md): the main loop puts the boop / reset counters here every frame, so a
+        # sim.py reads them as api.inputs without a readback: boop (count), boop_xy (canvas px), reset (count)
+        self.inputs = {"boop": 0, "boop_xy": (0.0, 0.0), "reset": 0}
         self._render_progs = []
         self._mp = None
         self._timing_last = 0.0
@@ -1289,7 +1677,7 @@ class ComputeStage:
             head += f"#define {k} {v}\n"
         src = head + self._common + "\n" + open(os.path.join(self.dir, file)).read()
         prog = self.ctx.compute_shader(src)
-        for name, unit in (("bands", MP_BANDS_UNIT), ("stems", STEMS_UNIT)):
+        for name, unit in (("bands", MP_BANDS_UNIT), ("stems", STEMS_UNIT), ("kickflat", KICK_UNIT)):
             try:
                 prog[name].value = unit
             except KeyError:
@@ -1329,30 +1717,21 @@ class ComputeStage:
 
     def set(self, kernel, uniforms):
         for name, val in uniforms.items():
-            try:
-                kernel[name].value = val
-            except KeyError:
-                pass
+            uset(kernel, name, val)
 
     def expose(self, uniform, tex):
         if uniform not in self._exposed:
             unit = COMPUTE_EXPOSE_UNIT_START + len(self._exposed)
             self._exposed[uniform] = [unit, tex]
             for p in self._render_progs:
-                try:
-                    p[uniform].value = unit
-                except KeyError:
-                    pass
+                uset(p, uniform, unit)
         self._exposed[uniform][1] = tex
         tex.use(location=self._exposed[uniform][0])
 
     def render_uniform(self, name, value):
         """Set a uniform on the buffer/Image passes (e.g. a blend weight the sim decides)."""
         for p in self._render_progs:
-            try:
-                p[name].value = value
-            except KeyError:
-                pass
+            uset(p, name, value)
 
     def buffer(self, letter):
         b = self._mp["buffers"][letter]
@@ -1365,10 +1744,7 @@ class ComputeStage:
         for uniform, (unit, tex) in self._exposed.items():
             tex.use(location=unit)
             for p in render_progs:
-                try:
-                    p[uniform].value = unit
-                except KeyError:
-                    pass
+                uset(p, uniform, unit)
 
     def programs(self):
         return self._kernels
@@ -1456,6 +1832,10 @@ def compile_mp_pass(ctx, common_src, code_src):
         pass
     try:
         prog["stems"].value = STEMS_UNIT
+    except KeyError:
+        pass
+    try:
+        prog["kickflat"].value = KICK_UNIT
     except KeyError:
         pass
     return prog
@@ -1679,12 +2059,75 @@ def render_multipass(ctx, mp, canvas_fbo, audio_channel_tex):
     mp["image_vao"].render(moderngl.TRIANGLE_STRIP)
 
 
+def render_windows(ctx, mp, presenters, win_state, audio_channel_tex):
+    """Re-run ONLY the Image pass for every head that has a windows.json entry (buffers and compute
+    already ran once for the ship). Each window renders into its OWN canvas-sized texture with the very
+    same iResolution as the front render, and the head then shows it through its normal crop-blit --
+    so at identity a window is pixel-for-pixel the front view for ANY shader, whatever its uv
+    convention (min(res), res.y ...). (First cut rendered at the head's native size: the dwarf's
+    min(iResolution) scale then framed ~2.2x wider than the front. Don't.)
+    Cheap when windows.json is absent: one failed stat per frame."""
+    now = time.monotonic()                                  # LEAN (2026-10-19): windows.json 4x a second, not every frame
+    if now - win_state.get("t", 0.0) >= 0.25:
+        win_state["t"] = now
+        m, entries = load_windows(win_state["m"])
+        win_state["m"] = m
+        if entries is not None:
+            win_state["entries"] = entries
+            print(f"windows: {len(entries)} window(s) active", file=sys.stderr)
+    prog = mp["image_prog"]
+    drew = False
+    for idx, p in enumerate(presenters):
+        e = (window_for(win_state["entries"], idx, p["spec"])
+             if win_state["entries"] and not win_state.get("suppress") else None)
+        v = p["view"]
+        if e is None:
+            if v is not None:
+                v["fbo"].release()
+                v["tex"].release()
+                p["view"] = None
+            continue
+        if v is None:
+            tex = ctx.texture((CANVAS_W, CANVAS_H), 4, dtype="f4")
+            tex.filter = (moderngl.LINEAR, moderngl.LINEAR)
+            v = p["view"] = {"tex": tex, "fbo": ctx.framebuffer(color_attachments=[tex])}
+        try:
+            prog["u_view_q"].value = e["q"]
+        except KeyError:
+            pass
+        try:
+            prog["u_view_fov"].value = e["fov"]
+        except KeyError:
+            pass
+        v["fbo"].use()
+        ctx.clear(0.0, 0.0, 0.0, 1.0)
+        mp["image_vao"].render(moderngl.TRIANGLE_STRIP)
+        drew = True
+    if drew:
+        # put the identity back so next frame's front render (which also re-sets it) starts clean
+        try:
+            prog["u_view_q"].value = VIEW_IDENTITY
+        except KeyError:
+            pass
+        try:
+            prog["u_view_fov"].value = 1.0
+        except KeyError:
+            pass
+
+
 def create_output_window(spec, share=None):
     glfw.window_hint(glfw.CONTEXT_VERSION_MAJOR, 4)
     glfw.window_hint(glfw.CONTEXT_VERSION_MINOR, 6)
     glfw.window_hint(glfw.OPENGL_PROFILE, glfw.OPENGL_CORE_PROFILE)
     glfw.window_hint(glfw.DECORATED, False)
     glfw.window_hint(glfw.FLOATING, True)
+    # 2026-10-09: created HIDDEN. A visible glfw window is first mapped as a
+    # normal window, which goes through i3 -- and while another app is
+    # fullscreen (VLC, a browser video) i3 leaves new windows unmapped, so
+    # glfw's wait for the window to become visible never ended: the renderer
+    # hung at startup and the backdrop stayed black. make_backdrop() below
+    # maps it itself, already override-redirect, past the window manager.
+    glfw.window_hint(glfw.VISIBLE, False)
 
     window = glfw.create_window(spec["w"], spec["h"], f"shader-backdrop-{spec['name']}", None, share)
     if not window:
@@ -1755,10 +2198,7 @@ def main():
         # unused uniforms, so a shader-dependent KeyError here is expected,
         # not an error.
         for p in active_programs():
-            try:
-                p[name].value = value
-            except KeyError:
-                pass
+            uset(p, name, value)
 
     bands_tex = ctx.texture((N_BANDS, 1), 1, dtype="f4")
     bands_tex.filter = (moderngl.LINEAR, moderngl.LINEAR)
@@ -1777,6 +2217,11 @@ def main():
     stems_tex.filter = (moderngl.NEAREST, moderngl.NEAREST)
     stems_tex.write(np.zeros((STEM_ROWS, N_BANDS), dtype="f4").tobytes())
     stems_tex.use(location=STEMS_UNIT)
+
+    kick_tex = ctx.texture((N_BANDS, 1), 1, dtype="f4")
+    kick_tex.filter = (moderngl.NEAREST, moderngl.NEAREST)
+    kick_tex.write(np.zeros(N_BANDS, dtype="f4").tobytes())
+    kick_tex.use(location=KICK_UNIT)
 
     # Live Shadertoy-style audio texture (real iChannel0 convention) --
     # (512,2), row0=freq (v~0.25), row1=wave (v~0.75), rewritten every
@@ -1816,6 +2261,10 @@ def main():
             p["stems"].value = STEMS_UNIT
         except KeyError:
             pass
+        try:
+            p["kickflat"].value = KICK_UNIT
+        except KeyError:
+            pass
         for i in range(4):
             try:
                 p[f"iChannel{i}"].value = i + 1
@@ -1840,6 +2289,7 @@ def main():
           file=sys.stderr)
 
     shader_mtime = current_mtime()
+    reload_check_t = [0.0]                       # hot-reload polling: at most every 0.2 s
     try:
         pointer_mtime = os.path.getmtime(ACTIVE_SHADER_FILE)
     except FileNotFoundError:
@@ -1864,12 +2314,15 @@ def main():
             new_pointer_mtime = os.path.getmtime(ACTIVE_SHADER_FILE)
         except FileNotFoundError:
             new_pointer_mtime = 0.0
-        if new_pointer_mtime != pointer_mtime:
-            pointer_mtime = new_pointer_mtime
-            new_path = resolve_active_shader_path()
+        if new_pointer_mtime == pointer_mtime:
+            return                   # LEAN (2026-10-19, user): NO hot-reload of edited shader files -- restart, or
+                                     #  `touch active_shader.txt` (= reload the active shader), or switch shaders
+        pointer_mtime = new_pointer_mtime
+        new_path = resolve_active_shader_path()
+        if True:
             if new_path != SHADER_PATH:
                 SHADER_PATH = new_path
-                shader_mtime = -1.0  # force the reload below regardless of the new target's mtime
+            shader_mtime = -1.0  # force the reload below (a switch, or a touch of the pointer = manual reload)
 
         mtime = current_mtime()
         if mtime == shader_mtime:
@@ -1882,6 +2335,19 @@ def main():
             print(f"pacing: target {pacing['target_fps']:.0f} -> {new_fps:.0f} fps",
                   file=sys.stderr)
             pacing["target_fps"] = new_fps
+        # Canvas size is fixed at startup (canvas_tex / canvas_fbo and the
+        # multipass buffers are allocated from it). A hot-reloaded shader that
+        # declares a different one cannot take effect without a restart -- say
+        # so loudly instead of silently blitting through the old canvas. The
+        # set-compare matches read_shader_canvas's portrait normalisation, so a
+        # landscape-digit declaration of the same portrait canvas is not a
+        # false alarm.
+        decl_canvas = read_shader_canvas(SHADER_PATH)
+        if set(decl_canvas) != {CANVAS_W, CANVAS_H}:
+            print(f"canvas: {os.path.basename(SHADER_PATH)} declares "
+                  f"{decl_canvas[0]}x{decl_canvas[1]} but this renderer started "
+                  f"with {CANVAS_W}x{CANVAS_H}; RESTART REQUIRED to apply "
+                  f"(~/bin/shader-renderer-ctl.sh start)", file=sys.stderr)
         try:
             new_prog, new_vao, new_mp, new_tex, new_sizes, new_live_audio = do_load(SHADER_PATH)
         except Exception as e:
@@ -1960,12 +2426,15 @@ def main():
         blit_vbo = win_ctx.buffer(quad.tobytes())
         blit_vao = win_ctx.vertex_array(blit_prog, [(blit_vbo, "2f", "in_pos")])
 
-        (u0, v0), (uscale, vscale) = crop_for_spec(spec)
+        (u0, v0), (uscale, vscale), rot = crop_for_spec(spec)
 
         presenters.append({
             "window": window, "ctx": win_ctx, "prog": blit_prog, "vao": blit_vao,
-            "uv_offset": (u0, v0), "uv_scale": (uscale, vscale),
+            "uv_offset": (u0, v0), "uv_scale": (uscale, vscale), "uv_rot": rot,
             "spec": spec,
+            # WINDOW view (windows.json): None = show the shared canvas as always. Otherwise
+            # {"tex","fbo"}: this head's own canvas-sized Image-pass render (see render_windows).
+            "view": None,
             # Last time this window was actually blitted+swapped. Secondaries
             # are skipped on iterations that would exceed their own refresh;
             # their front buffer just holds the previous frame.
@@ -2001,8 +2470,9 @@ def main():
     # rebound as a whole: rebinding a name is atomic under the GIL, so the
     # loop can never observe a half-updated set of values, and no lock is
     # needed on a path that runs every frame.
-    #   (delayed_frame, stems_array(4,120) float32 or None, scalars dict)
-    audio_state = [(None, None, {})]
+    #   (delayed_frame, stems_array(4,120) float32 or None, scalars dict,
+    #    kick weights (120,) float32 or None)
+    audio_state = [(None, None, {}, None)]
     stem_splitter = stem_split.StemSplitter(N_BANDS)
     # Tempo/phase tracking (2026-09-21, scope.md). Lives here rather than in a
     # shader because a tempo estimator needs HISTORY, and a shader has nowhere
@@ -2021,10 +2491,52 @@ def main():
     beat_cache_on = os.environ.get("SHADER_BEAT_CACHE", "1") != "0"
     beat_sess = beat_session.BeatSession(
         beat_tracker, delay_fn=read_audio_delay_seconds, enabled=beat_cache_on)
+    # Shared music-state layer (2026-10-11, scope.md "song cache in shaders: ONE
+    # live-capable interface"): u_ms_* uniforms -- section scores, changes,
+    # look-ahead -- live for every song, refined by the offline song analysis
+    # when the playing song has one. Shares beat_sess's NowPlaying.
+    held = held_tone.HeldTone()
+    music = music_state.MusicState(N_BANDS, np_source=beat_sess.np,
+                                   delay_fn=read_audio_delay_seconds)
+    replay = song_replay.Replay()        # 2026-10-20 silent song-replay test mode (song_replay.py)
+    # Diagnostic capture (scope.md 2026-10-13 synthetic clock): when
+    # SHADER_CAPTURE_JSONL is set, append one JSON line per drawn frame with the
+    # scalars the fallback gate will read. Off by default; never affects render.
+    capture_path = os.environ.get("SHADER_CAPTURE_JSONL")
+    capture_fh = open(capture_path, "a", buffering=1) if capture_path else None
+
+    # Per-band delay compensation (2026-10-08, scope.md "sharper band filters").
+    # The native band filters are Butterworth bandpasses of graded order
+    # ([filters] orders in shader_bands.conf); a sharper filter answers later,
+    # by its group delay (up to ~0.28 s at A0). band_filters.py mirrors the
+    # exact design, so each band is read that much LATER in the history --
+    # every consumer (bands texture, stems, kick detector) sees the bands lined
+    # up with what you hear. The look-ahead the delay holds back pays for it.
+    # SHADER_BAND_DELAY_COMP=0 disables it.
+    band_delay_s = (band_filters.delays_s()
+                    if os.environ.get("SHADER_BAND_DELAY_COMP", "1") != "0"
+                    else np.zeros(N_BANDS))
+    print(f"band delay compensation: max {band_delay_s.max() * 1000:.0f} ms "
+          f"(orders {band_filters.read_orders()})", file=sys.stderr)
+
+    def comp_rows(snap, lo, hi, rate_hz):
+        """Rows lo..hi-1 of the history, each band taken its own delay later."""
+        sh = np.round(band_delay_s * rate_hz).astype(int)
+        top = min(len(snap), hi + int(sh.max()))
+        # rows carry a float64 copy of their bands made once on arrival ("_b"): stacking those
+        # is ~5x cheaper than re-converting the python lists every call (2026-10-13: this line
+        # was ~46% of the audio thread, which starved the render loop at 60 fps via the GIL)
+        b = np.stack([r["_b"] if "_b" in r else np.asarray(r["bands"], dtype=np.float64)
+                      for r in snap[lo:top]])
+        t = np.minimum(np.arange(hi - lo)[:, None] + sh[None, :], len(b) - 1)
+        out = b[t, np.arange(b.shape[1])[None, :]]
+        np.nan_to_num(out, copy=False, nan=0.0, posinf=0.0, neginf=0.0)
+        return out
 
     def audio_reader_thread():
         last_ts = None
         last_split = 0.0
+        last_frame_t = 0.0       # monotonic time the last NEW audio frame arrived
         rate_hz = 188.0          # refined from real timestamps below
         win = stem_split.window_frames(rate_hz)
         while True:
@@ -2032,9 +2544,49 @@ def main():
                 frame = reader.read()
                 if frame is not None and frame["timestamp"] != last_ts:
                     last_ts = frame["timestamp"]
+                    frame["_b"] = np.asarray(frame["bands"], dtype=np.float64)
                     band_history.append(frame)
+                    last_frame_t = time.monotonic()
 
                 now = time.monotonic()
+                # 2026-10-20 SONG REPLAY test mode (song_replay.py, ~/bin/backdrop-replay): while the flag file names a
+                # computed song, its analysis drives the backdrop (beats, sections, drum hits, loudness) and the live
+                # audio is ignored -- tune shaders to real music while the speakers play a video.
+                if replay.active(now):
+                    if now - last_split >= STEM_UPDATE_PERIOD:
+                        last_split = now
+                        try:
+                            rframe, ru = replay.tick(now, META_FEATURES)
+                            prev = audio_state[0]
+                            scalars = dict(prev[2])
+                            scalars.update(ru)
+                            audio_state[0] = (rframe, np.zeros((STEM_ROWS, N_BANDS), dtype="f4"), scalars,
+                                              np.zeros(N_BANDS, dtype="f4"))
+                        except Exception as e:      # never take the audio thread down
+                            print(f"song_replay: {e}", file=sys.stderr)
+                    time.sleep(0.0008)
+                    continue
+                # No fresh audio (nothing playing / sink idle): the block below would
+                # never run (empty history) or keep re-feeding the last frame, freezing
+                # the backdrop. Let the synthetic clock drive it instead (scope.md
+                # 2026-10-13 synthetic clock); real frames take over again as they arrive.
+                if now - last_split >= STEM_UPDATE_PERIOD and (
+                        not band_history or now - last_frame_t > AUDIO_IDLE_S):
+                    last_split = now
+                    try:
+                        synth = music.idle(now)
+                    except Exception as e:      # never take the audio thread down
+                        synth = None
+                        print(f"music_state idle: {e}", file=sys.stderr)
+                    if synth is not None:
+                        prev = audio_state[0]
+                        zeros = np.zeros((STEM_ROWS, N_BANDS), dtype="f4")
+                        scalars = dict(prev[2])
+                        scalars.update({"u_stem_drums": 0.0, "u_stem_bass": 0.0, "u_stem_tonal": 0.0})
+                        scalars.update(synth)
+                        audio_state[0] = (prev[0], zeros, scalars, np.zeros(N_BANDS, dtype="f4"))
+                    time.sleep(0.0008)
+                    continue
                 # Recompute at a fixed cadence rather than per published block:
                 # the separation is a windowed median, so re-running it 188x a
                 # second would spend real CPU to move a slow-moving result by
@@ -2057,8 +2609,7 @@ def main():
                             half = win // 2
                             lo = max(0, idx - half)
                             hi = min(len(snap), idx + half + 1)
-                            rows = np.array([r["bands"] for r in snap[lo:hi]],
-                                            dtype=np.float64)
+                            rows = comp_rows(snap, lo, hi, rate_hz)
                             np.nan_to_num(rows, copy=False, nan=0.0,
                                           posinf=0.0, neginf=0.0)
                             out = stem_splitter.split(rows, idx - lo, rate_hz)
@@ -2072,19 +2623,77 @@ def main():
                                 "u_stem_bass": float(out["bass"].max()),
                                 "u_stem_tonal": float(out["tonal"].max()),
                             }
+                            try:                        # clear long-held notes (held_tone.py)
+                                scalars.update(held.update(out["tonal"]))
+                            except Exception as e:
+                                print(f"held_tone: {e}", file=sys.stderr)
                             # Fed the DRUMS row, at this same 60 Hz cadence.
                             # snap[idx]["timestamp"] is the delay-aligned audio
                             # clock (what the shader is actually showing);
                             # monotonic() advances the beat count, so a stalled
                             # audio stream cannot freeze the orrery.
+                            # Look-ahead window for the beat tracker's DP phase
+                            # (beat_track.py LOOKAHEAD_*): the low-band onset
+                            # function of the delay-compensated bands, past AND
+                            # future around the drawn frame -- one source for
+                            # both sides, so there is no seam.
+                            lp = int(beat_track.LOOKAHEAD_PAST_S * rate_hz)
+                            lf = int(beat_track.LOOKAHEAD_FUTURE_S * rate_hz)
+                            blo = max(0, idx - lp)
+                            bhi = min(len(snap), idx + lf + 1)
+                            bodf = kick_detect._flux(comp_rows(snap, blo, bhi, rate_hz))
                             scalars.update(beat_tracker.update(
                                 out["drums"], snap[idx]["timestamp"],
-                                time.monotonic()))
+                                time.monotonic(), (bodf, idx - blo, rate_hz)))
                             # Sets the tracker's reference for the NEXT sample
                             # when the song is recognised, and records this one
                             # when it is not.
                             beat_sess.update()
-                            audio_state[0] = (snap[idx], tex, scalars)
+                            # Kick flatten weights for the drawn frame, from
+                            # the history around it -- the frames after idx
+                            # are the look-ahead (kick_detect.py needs ~0.85 s,
+                            # the speaker delay is >= ~1 s).
+                            kb = kick_detect.history_frames(rate_hz)
+                            klo = max(0, idx - kb[0])
+                            khi = min(len(snap), idx + kb[1] + 1)
+                            krows = comp_rows(snap, klo, khi, rate_hz)
+                            np.nan_to_num(krows, copy=False, nan=0.0,
+                                          posinf=0.0, neginf=0.0)
+                            kick = kick_detect.weights_at(
+                                krows, idx - klo, rate_hz, N_BANDS).astype("f4")
+                            scalars["u_kick"] = kick_detect.kick_weight(kick)
+                            scalars["u_drum_mid"] = kick_detect.range_weight(kick, "mid")    # snare body, toms
+                            scalars["u_drum_high"] = kick_detect.range_weight(kick, "high")  # snare rattle, hats
+                            drawn = dict(snap[idx])
+                            drawn["bands"] = comp_rows(snap, idx, idx + 1, rate_hz)[0].tolist()
+                            try:
+                                scalars.update(music.update(drawn, out["tonal"], scalars,
+                                                            time.monotonic()))
+                            except Exception as e:      # never take the audio thread down
+                                print(f"music_state: {e}", file=sys.stderr)
+                            audio_state[0] = (drawn, tex, scalars, kick)
+                            if capture_fh is not None:
+                                try:
+                                    capture_fh.write(json.dumps({
+                                        "t": round(time.monotonic(), 3),
+                                        "bt": round(float(scalars.get("u_beat_count", -1.0)), 3),
+                                        "conf": round(float(scalars.get("u_beat_conf", -1.0)), 4),
+                                        "bpm": round(float(scalars.get("u_beat_bpm", -1.0)), 2),
+                                        "kick": round(float(scalars.get("u_kick", 0.0)), 4),
+                                        "dmid": round(float(scalars.get("u_drum_mid", 0.0)), 4),
+                                        "dhi": round(float(scalars.get("u_drum_high", 0.0)), 4),
+                                        "rms": round(float(drawn.get("rms", 0.0)), 4),
+                                        "onset": round(float(drawn.get("onset", 0.0)), 4),
+                                        "flux": round(float(drawn.get("flux", 0.0)), 4),
+                                        "ms_src": scalars.get("u_ms_source", -1.0),
+                                        "ms_score": round(float(getattr(music, "music_score", -1.0)), 4),
+                                        "mode": getattr(music, "mode", "?"),
+                                        "cur_a": [round(float(x), 4) for x in scalars.get("u_ms_cur_a", ())],
+                                        "cur_b": [round(float(x), 4) for x in scalars.get("u_ms_cur_b", ())],
+                                        "ms_change": scalars.get("u_ms_change", -1.0),
+                                    }) + "\n")
+                                except Exception as e:
+                                    print(f"capture: {e}", file=sys.stderr)
             except Exception as e:
                 # A crash in here must never take the backdrop down -- the
                 # render loop falls back to its previous values.
@@ -2094,6 +2703,43 @@ def main():
 
     threading.Thread(target=audio_reader_thread, daemon=True,
                      name="audio-reader").start()
+
+    # ---- X POLLER (2026-10-20, perfseg + py-spy: the X11 round trips query_pointer / query_keymap took a MEDIAN 4-5 ms and
+    # a p90 16-18 ms each -- Xorg is busy feeding three Sunshine streams -- and the frame loop waited for both, every
+    # frame: that WAS the ~28 ms "inputs" stage). Now a daemon thread with its OWN X connection asks ~60x a second; the
+    # frame loop only reads the latest answer (never waits). Each call site is inside a try: no answer yet = its old
+    # error path.
+    xpoll = {"ptr": None, "km": None}
+
+    def x_poller():
+        try:
+            from Xlib import display as _xdisplay
+            xd = _xdisplay.Display(primary_xdisp.get_display_name())
+            xroot = xd.screen().root
+        except Exception as e:
+            print(f"x poller: no own X connection ({e}) -- mouse/keys unavailable", file=sys.stderr)
+            return
+        while True:
+            try:
+                xpoll["ptr"] = xroot.query_pointer()
+                xpoll["km"] = xd.query_keymap()
+            except Exception:
+                time.sleep(0.5)
+            time.sleep(1.0 / 60.0)
+
+    threading.Thread(target=x_poller, name="x_poller", daemon=True).start()
+
+    def _xptr():
+        p = xpoll["ptr"]
+        if p is None:
+            raise RuntimeError("x poller: no pointer yet")
+        return p
+
+    def _xkm():
+        k = xpoll["km"]
+        if k is None:
+            raise RuntimeError("x poller: no keymap yet")
+        return k
 
     def read_mouse_real():
         # Real X11 pointer position, mapped into canvas space via the
@@ -2124,12 +2770,30 @@ def main():
         crop_x = (CANVAS_W - primary_spec["w"] * k) / 2.0
         crop_y = (CANVAS_H - primary_spec["h"] * k) / 2.0
         try:
-            p = primary_xdisp.screen().root.query_pointer()
+            p = _xptr()
             mx = float((p.root_x - primary_spec["x"]) * k + crop_x)
             my = float(CANVAS_H - ((p.root_y - primary_spec["y"]) * k + crop_y))
             return (mx, my, 0.0, 0.0)
         except Exception:
             return (0.0, 0.0, 0.0, 0.0)
+
+    def read_pointer_canvas():
+        # 2026-10-12 THE HAND: the cursor in canvas px on WHICHEVER output it is on (read_mouse_real assumes the
+        # primary output, so a boop on the landscape head landed off-canvas at x ~3000+). Same crop math per output.
+        try:
+            p = _xptr()
+            px, py = p.root_x, p.root_y
+        except Exception:
+            return (0.0, 0.0)
+        spec = OUTPUTS[0]
+        for sp in OUTPUTS:
+            if sp["x"] <= px < sp["x"] + sp["w"] and sp["y"] <= py < sp["y"] + sp["h"]:
+                spec = sp
+                break
+        k = canvas_per_screen(spec)
+        crop_x = (CANVAS_W - spec["w"] * k) / 2.0
+        crop_y = (CANVAS_H - spec["h"] * k) / 2.0
+        return (float((px - spec["x"]) * k + crop_x), float(CANVAS_H - ((py - spec["y"]) * k + crop_y)))
 
     def read_mouse_synthetic(frame):
         # Audio-driven iMouse: u_centroid (spectral brightness, independent
@@ -2169,7 +2833,7 @@ def main():
         if not steer_keycode:
             return 0.0
         try:
-            km = primary_xdisp.query_keymap()
+            km = _xkm()
             return 1.0 if (km[steer_keycode >> 3] & (1 << (steer_keycode & 7))) else 0.0
         except Exception:
             return 0.0
@@ -2183,12 +2847,13 @@ def main():
 
     ctrl_keycode  = resolve_keycode("Control_L")
     shift_keycode = resolve_keycode("Shift_L")
+    alt_keycode   = resolve_keycode("Alt_L")      # 2026-10-12 THE HAND: Super + Alt tap = boop
 
     def read_key(code):
         if not code:
             return 0.0
         try:
-            km = primary_xdisp.query_keymap()
+            km = _xkm()
             return 1.0 if (km[code >> 3] & (1 << (code & 7))) else 0.0
         except Exception:
             return 0.0
@@ -2206,11 +2871,31 @@ def main():
     freefly_dirty = {"v": False, "last": 0.0}
     prev_mouse = None
     prev_steering = False
+    hand = {"alt": False, "rst": False, "boop": 0, "reset": 0, "xy": (0.0, 0.0)}
     gyro = {"m": -1.0, "active": False, "xy": (0.0, 0.0, 0.0), "prev": None}
     persist_last = {"t": 0.0, "dir": None, "saved": None}
     autozoom = {"m": -1.0, "v": 0.0}
     cam_target = {"m": -1.0, "t": (0.0, 0.0, 0.0, 0.0), "id": 0.0}
     autodive = {"m": -1.0, "on": False, "beats": 0.0, "last": None, "id": None}
+    # DroidPad control surface (see PAD_FILE). The *_prev dicts hold last frame's
+    # counters so an impulse is the exact delta (never a missed press); sep is a
+    # latched separation nudge the dpad moves and that stays put.
+    #
+    # cam / boop (2026-10-15, the brown-dwarf remote): the pad's own free-fly, kept
+    # SEPARATE from mouse_cam. mouse_cam is a hand-dialled framing shared by every
+    # flying shader (and persisted to freefly_state.txt), so a stick that wrote into
+    # it would silently shove string_world/nebulabrot/the flyers around. cam holds
+    # the same six offsets, but only the ctrl_ variant of a shader reads them.
+    # boop is the reticle the third stick places: (canvas px x, canvas px y, active),
+    # the SAME convention as hand["xy"] so sim.py treats it with identical code.
+    pad = {"m": -1.0, "doc": None, "alive": 0.0,
+           "prev_trigger": {}, "prev_dpad": {}, "sep": 0.0, "gate": 0.0,
+           "cam": {k: 0.0 for k in FREEFLY_KEYS}, "cq": VIEW_IDENTITY, "mv": [0.0, 0.0, 0.0], "boop": (0.0, 0.0, 0.0),
+           "shocks": (0.0, 0.0), "fire": (0.0, 0.0, 0.0), "speed": 1.0, "synced": False,
+           "wheel": 0.0, "ids": None, "frenzy": 0.5, "pocket": 0.0,
+           "peri_q0": None, "peri_cq0": VIEW_IDENTITY}   # PERISCOPE: the phone's / the camera's pose at engage
+    # the Xbox controller (GAMEPAD_FILE): mtime cache + last press counters (taps are edge-diffed per frame)
+    xb = {"m": -1.0, "doc": None, "alive": 0.0, "prev_press": None, "map": XB_LAYER_MAP, "map_m": None}
 
     def autodive_next():
         # the same step as `backdrop-dive next`: stop idx+1, or 1 past the last
@@ -2239,7 +2924,11 @@ def main():
 
     def read_camera():
         # Cached on mtime: this is polled every frame, but the file only
-        # changes when a keybinding fires.
+        # changes when a keybinding fires. LEAN (2026-10-19): stat at most 4x a second.
+        now = time.monotonic()
+        if now - camera_cache.get("t", 0.0) < 0.25:
+            return camera_cache["value"]
+        camera_cache["t"] = now
         try:
             mtime = os.path.getmtime(CAMERA_FILE)
         except OSError:
@@ -2254,6 +2943,30 @@ def main():
                 camera_cache["value"] = CAMERA_DEFAULT
             camera_cache["mtime"] = mtime
         return camera_cache["value"]
+
+    def read_pad():
+        """Poll pad.json (mtime-cached) -> the DroidPad state, or None if stale.
+
+        Stale or absent means the phone is not connected: u_pad_alive goes 0 and
+        shaders fall back to their own motion instead of holding the last command
+        forever. See PAD_FILE's comment for the whole contract."""
+        try:
+            mtime = os.path.getmtime(PAD_FILE)
+        except OSError:
+            pad["alive"] = 0.0
+            return None
+        if time.time() - mtime > PAD_STALE_S:
+            pad["alive"] = 0.0
+            return None
+        pad["alive"] = 1.0
+        if mtime != pad["m"]:
+            pad["m"] = mtime
+            try:
+                with open(PAD_FILE) as fh:
+                    pad["doc"] = json.load(fh)
+            except (OSError, ValueError):
+                pass
+        return pad["doc"]
 
     def read_mouse_mode():
         try:
@@ -2284,12 +2997,16 @@ def main():
     onset_smooth = 0.0
     color_phase = 0.0
     print("renderer: entering main loop (close window or Ctrl+C to stop)", file=sys.stderr)
+    win_state = {"m": None, "entries": []}
     perf_last = time.monotonic()
     perf_frames = 0
     perf_frame_ms_sum = 0.0
     perf_render_ms_sum = 0.0
     perf_min_ms = 1e9
     perf_max_ms = 0.0
+    seg = {}                                  # PERFSEG (2026-10-20): per-stage ms sums, printed with every perf line
+    def seg_add(k, v):
+        seg[k] = seg.get(k, 0.0) + v
     try:
         crop_for = crop_for_spec
 
@@ -2324,8 +3041,9 @@ def main():
                 # reassert itself when a window is reconfigured.
                 make_backdrop(glfw.get_x11_window(win),
                               spec["x"], spec["y"], spec["w"], spec["h"])
-                off, scale = crop_for(spec)
+                off, scale, rot = crop_for(spec)
                 presenters[i]["uv_offset"], presenters[i]["uv_scale"] = off, scale
+                presenters[i]["uv_rot"] = rot
             return changed
 
         LAYOUT_POLL_SECONDS = 5.0
@@ -2369,7 +3087,9 @@ def main():
 
             t2 = time.monotonic()
             glfw.make_context_current(primary_window)
-            try_reload()
+            if t2 - reload_check_t[0] >= 0.25:      # (LEAN: one stat of active_shader.txt, 4x a second)
+                reload_check_t[0] = t2
+                try_reload()
             frame_start = time.monotonic()
             t3 = frame_start
 
@@ -2408,8 +3128,23 @@ def main():
             set_uniform("u_cam_yaw", cam_yaw)
             set_uniform("u_cam_zoom", cam_zoom)
             set_uniform("u_steer", super_held)
+            # 2026-10-12 THE HAND (scope.md "THE HAND"): with the steer key held, a TAP of Alt_L = one BOOP at the
+            # cursor (a single poke, user: "hold is aggressive, let's rather boop"), Ctrl_L + Shift_L together = RESET.
+            # Both are counters (+1 per press), so a shader or sim.py reacts when the value changes and never
+            # misses a one-frame press. u_hand = (boop x, boop y in canvas px, boop count, reset count).
+            alt_on = steering and read_key(alt_keycode) > 0.5
+            ctl_on = read_key(ctrl_keycode) > 0.5 if steering else False
+            shf_on = read_key(shift_keycode) > 0.5 if steering else False
+            reset_on = steering and ctl_on and shf_on
+            if alt_on and not hand["alt"]:
+                hand["boop"] += 1
+                hand["xy"] = read_pointer_canvas()
+            if reset_on and not hand["rst"]:
+                hand["reset"] += 1
+            hand["alt"], hand["rst"] = alt_on, reset_on
+            set_uniform("u_hand", (hand["xy"][0], hand["xy"][1], float(hand["boop"]), float(hand["reset"])))
             # first steered frame only records the position (prev was the audio mouse)
-            if steering and prev_mouse is not None and prev_steering:
+            if steering and prev_mouse is not None and prev_steering and not alt_on and not reset_on:
                 mdx = cur_mouse[0] - prev_mouse[0]
                 mdy = cur_mouse[1] - prev_mouse[1]
                 if read_key(ctrl_keycode) > 0.5:
@@ -2442,31 +3177,588 @@ def main():
             # one on release), so no motion is lost to a missed sample
             if gyro["active"] or (gyro["prev"] is not None and time.time() - gyro["m"] <= GYRO_STALE_S):
                 if gyro["prev"] is not None:
-                    mouse_cam["yaw"]   += (gyro["xy"][0] - gyro["prev"][0]) * MOUSE_LOOK_SENS
-                    mouse_cam["pitch"] += (gyro["xy"][1] - gyro["prev"][1]) * MOUSE_LOOK_SENS
+                    dyaw   = (gyro["xy"][0] - gyro["prev"][0]) * MOUSE_LOOK_SENS   # rad
+                    dpitch = (gyro["xy"][1] - gyro["prev"][1]) * MOUSE_LOOK_SENS   # rad
+                    dturn  = (gyro["xy"][2] - gyro["prev"][2]) * MOUSE_MOVE_SENS   # world units
+                    mouse_cam["yaw"]   += dyaw
+                    mouse_cam["pitch"] += dpitch
                     # twist about the pointing axis = Super + Ctrl vertical drag
                     # (nebulabrot: zoom; free-fly shaders: forward/back)
-                    mouse_cam["f"]     += (gyro["xy"][2] - gyro["prev"][2]) * MOUSE_MOVE_SENS
+                    mouse_cam["f"]     += dturn
+                    # ---- the SAME motion into the free camera (2026-10-16) ----------------
+                    # ctrl_brown_dwarf reads u_pad_cam_q / u_pad_move and none of the u_cam_* it
+                    # stopped reading, so the Euler camera above is the legacy one. The phone drives
+                    # BOTH, exactly as the pad's Look stick already does (see the pad block): its
+                    # pointing turns the free camera about the camera's OWN axes (no clamps, and it
+                    # composes with a stick that is doing the same thing), and its twist walks the
+                    # camera along the axis it is already facing -- Move's own "go where you look".
+                    # Same angles as the legacy path, so the gains the phone was tuned with hold.
+                    if pad["alive"] > 0.5:
+                        if abs(dyaw) > 1e-9 or abs(dpitch) > 1e-9:
+                            dq = view_quat(math.degrees(dyaw), math.degrees(dpitch), 0.0)
+                            q = quat_mul(pad["cq"], dq)
+                            n = math.sqrt(sum(c * c for c in q)) or 1.0
+                            pad["cq"] = tuple(c / n for c in q)
+                        if abs(dturn) > 1e-9:
+                            fwd = quat_rot(pad["cq"], (0.0, 0.0, dturn))
+                            for i in range(3):
+                                pad["mv"][i] += fwd[i]
                 gyro["prev"] = gyro["xy"] if gyro["active"] else None
                 super_held = 1.0          # the free-fly pose gets saved like a Super steer
                 set_uniform("u_steer", 1.0)   # shaders gating on it see a steer
             else:
                 gyro["prev"] = None
+            # ---- DroidPad control surface (see PAD_FILE) ----
+            # Publishes forces / bias / pressed-edges ONLY. It never sets a
+            # position, angle, colour or cue: each shader decides how hard to lean
+            # on these, so the sim keeps its own movementset. u_pad_alive 0 means
+            # the phone is gone -- use your own motion.
+            pdoc = read_pad()
+            pwidgets = (pdoc or {}).get("widgets", {})
+            # "3D POV" pad switch: explicitly OFF = suppress every ship window (heads show the
+            # plain shared canvas again). Absent widget / no pad = windows as configured.
+            _pov = pwidgets.get("3D POV")
+            win_state["suppress"] = _pov is not None and not _pov.get("state")
+            pderiv = (pdoc or {}).get("derived", {})
+            ptrigger = pderiv.get("trigger", {})
+            pheld = pderiv.get("held", {})
+            pdpad = pderiv.get("dpad", {})
+            pnow = time.time()      # one clock for every spring-return TTL test this frame
+            # Pressed EDGES: the bridge counts every MQTT event, we diff the counters per frame.
+            # Two different things hide in "a widget I have not seen before", and the difference
+            # is exactly what makes a button's first press work:
+            #   * the first fresh read of the WHOLE surface -- the phone may have been in use
+            #     long before this renderer started, so ADOPT its counters as history, or a
+            #     restart would replay the session so far as a burst of phantom presses;
+            #   * a widget that shows up LATER -- that can only be a brand-new press (the app
+            #     starts every widget at zero and the bridge writes as each event arrives), so
+            #     count it from zero. Defaulting a missing widget to its own count is what made
+            #     the first press of a button vanish on a pad profile the renderer had not
+            #     seen yet.
+            # And if a counter goes BACKWARDS, the bridge restarted (they live in that process):
+            # the whole new count is real presses, and treating the dip as negative would eat
+            # the one press that caused it.
+            if not pad["synced"] and pdoc is not None:
+                pad["synced"] = True
+                pad["prev_trigger"] = dict(ptrigger)
+                pad["prev_dpad"] = dict(pdpad)
+            impulses = {}
+            for wid, n in ptrigger.items():
+                prev = pad["prev_trigger"].get(wid, 0)
+                d = n if n < prev else n - prev
+                if d > 0:
+                    impulses[wid] = float(d)
+            pad["prev_trigger"] = dict(ptrigger)
+            # PAD ALIASES (2026-10-22): the user's "starbox" pad names its widgets by what they do; map them onto the
+            # ids the shaders read. A switch/slider: the newer of the two wins. A press: both count.
+            if any(src in pwidgets or src in impulses for src in PAD_ALIASES):
+                pwidgets = dict(pwidgets)
+                for src, dst in PAD_ALIASES.items():
+                    if src in pwidgets:
+                        cur = pwidgets.get(dst)
+                        if cur is None or pwidgets[src].get("t", 0.0) >= cur.get("t", 0.0):
+                            pwidgets[dst] = pwidgets[src]
+                    if src in impulses:
+                        impulses[dst] = impulses.get(dst, 0.0) + impulses[src]
+            # Every button/trigger press is announced once: `u_pad_fly` / `u_pad_down` / `u_pad_fire`
+            # go to every shader, so a shader that reads none of them and a button whose id is
+            # mistyped look identical from here -- this line is what tells the two apart.
+            if impulses:
+                print("pad press: %s" % ", ".join(sorted(impulses)), file=sys.stderr)
+            dclicks = {}
+            for d, n in pdpad.items():
+                prev = pad["prev_dpad"].get(d, 0)
+                dclicks[d] = n if n < prev else n - prev
+            pad["prev_dpad"] = dict(pdpad)
+            # 2026-10-23 (ctrl_ringbox_v2 CAM STEERING): raw JOYSTICK deflections by widget id + this frame's dpad
+            # clicks, handed to a sim as-is (no shared camera, no alias) -- the sim owns its own free camera.
+            pad["joy"] = {k: pad_xy(pwidgets, k, pnow) for k, v in pwidgets.items() if (v or {}).get("type") == "JOYSTICK"}
+            pad["dclicks"] = dict(dclicks)
+            # dpad nudges the figures' distance to one another: each click a step,
+            # and it stays where you nudged it
+            pad["sep"] = max(-1.0, min(1.0, pad["sep"] + (
+                dclicks.get("RIGHT", 0) - dclicks.get("LEFT", 0)) * PAD_SEP_STEP))
+            set_uniform("u_pad_alive", pad["alive"])
+            set_uniform("u_pad_tilt", pad_xy(pwidgets, "Tilt", pnow))
+            set_uniform("u_pad_depth", pad_xy(pwidgets, "Depth", pnow))
+            set_uniform("u_pad_hue", (pad_val(pwidgets, "Hue1"), pad_val(pwidgets, "Hue2")))
+            # Rose-pocket override: the dial's REST (0) is NO override -- the shader falls back to the
+            # music's own density drive. Scale is /10, not /5: step sliders arrive RAW on the app's
+            # 0..10 scale (pads/README.md), so /5 saturated from half travel on.
+            pad["pocket"] = max(0.0, min(1.0, pad_val(pwidgets, "Pocket") / 10.0))
+            # The `Frenzy` 3-stop dial (raw 0 / 5 / 10): 0 = off, 0.5 = auto (the music gate),
+            # 1 = on. An ABSENT dial publishes 0.5, not 0: a pad without the widget must behave
+            # like the music halves, and 0 would silently kill the frenzy for every shader that
+            # reads this.
+            pad["frenzy"] = (max(0.0, min(1.0, pad_val(pwidgets, "Frenzy") / 10.0))
+                             if "Frenzy" in pwidgets else 0.5)
+            set_uniform("u_pad_pocket", pad["pocket"])
+            set_uniform("u_pad_frenzy", pad["frenzy"])
+            # `Auto Moves` RESTS AT AUTO, the same rule as the `Frenzy` dial's absent 0.5: an absent
+            # switch must leave this half behaving like the pad-free one (the music's own,
+            # phrase-paced specials), never like the free-for-all -- that is the LEAST INVASIVE
+            # setting, and it is where a freshly reloaded pad rests, because a reload publishes
+            # nothing until a widget is touched. Existence, not value, decides: only an explicit OFF
+            # turns the busy mode on, and a pad that is gone cannot leave it latched.
+            auto_moves = (pad_sw(pwidgets, "Auto Moves") if "Auto Moves" in pwidgets else 1.0)
+            set_uniform("u_pad_sw", (pad_sw(pwidgets, "Half Frenzy"), auto_moves))
+            set_uniform("u_pad_sep", pad["sep"])
+            # ---- PAD FLIGHT: the Look / Move sticks as hold-to-steer camera -----------------
+            # (user 2026-10-15: "maybe we can actually add 3d camera flight and improve the
+            # kind of booping") Integrated HERE, once, and published twice -- as u_pad_look /
+            # u_pad_move for the image pass AND into the compute inputs below -- because
+            # brown_dwarf mirrors its camera in sim.py to turn a cursor into a world ray. A
+            # camera that lives in two places must not be integrated in two places, or the
+            # boop lands wherever the shader's copy of the camera happens to be.
+            cam = pad["cam"]
+            clx, cly = pad_xy(pwidgets, "Look", pnow)
+            cmx, cmy = pad_xy(pwidgets, "Move", pnow)
+            if pad["alive"] > 0.5:
+                clx = 0.0 if abs(clx) < PAD_CAM_DEADZONE else clx
+                cly = 0.0 if abs(cly) < PAD_CAM_DEADZONE else cly
+                cmx = 0.0 if abs(cmx) < PAD_CAM_DEADZONE else cmx
+                cmy = 0.0 if abs(cmy) < PAD_CAM_DEADZONE else cmy
+                cam["yaw"]   += clx * PAD_CAM_LOOK_RATE * dt
+                cam["pitch"] += cly * PAD_CAM_LOOK_RATE * dt * PAD_STICK_Y_UP
+                cam["r"]     += cmx * PAD_CAM_MOVE_RATE * dt
+                cam["f"]     += cmy * PAD_CAM_MOVE_RATE * dt * PAD_STICK_Y_UP
+                # ---- ... AND A THIRD HAND ON THE SHARED CAMERA (the GENERAL REMOTE, 2026-10-15) --
+                # (user) "one general kinda remote that does the simple lookaround/skybox rotation/
+                # orbit camera kinda movement for all the shaders doing the mod+ctrl or mod+shift
+                # with mouse stuff". The look-around family already reads ONE camera -- u_cam_look /
+                # u_cam_move -- which the hand dials with Super+cursor and the phone gyro drags; so
+                # the general remote is not a feature per shader, it is THIS block. The same two
+                # sticks, same rates and same signs as the pad's own free-fly above, are added into
+                # that same accumulator, so a stick drags the shared camera exactly the way a
+                # cursor does: 22 shaders read u_cam_look, 10 read u_cam_move and 30 gate on
+                # u_steer, and not one of them learns the phone exists. Shaders with their own bespoke
+                # pad camera (brown dwarf, via u_pad_look) read no shared channel, so nothing here
+                # doubles up on them. Idle sticks add nothing and raise no flag -- which is what keeps
+                # an untouched pad, and the whole AUTO half it is paired with, untouched as authored.
+                if clx or cly or cmx or cmy:
+                    pdt = min(dt, PAD_STEER_DT_MAX)
+                    mouse_cam["yaw"]   += clx * PAD_CAM_LOOK_RATE * pdt
+                    mouse_cam["pitch"] += cly * PAD_CAM_LOOK_RATE * pdt * PAD_STICK_Y_UP
+                    mouse_cam["r"]     += cmx * PAD_CAM_MOVE_RATE * pdt
+                    mouse_cam["f"]     += cmy * PAD_CAM_MOVE_RATE * pdt * PAD_STICK_Y_UP
+                    # "A hand is steering", said exactly the way the gyro path says it: shaders that
+                    # gate their camera on u_steer apply the offsets they were just handed, and the
+                    # pose is saved like a Super steer rather than only living in this process.
+                    super_held = 1.0
+                    set_uniform("u_steer", 1.0)
+            # ---- FREE CAMERA (2026-10-16, ctrl_brown_dwarf): one quaternion about the camera's OWN
+            # axes (no clamps, no Euler) + a position offset in the AUTHORED frame. Move's stick
+            # vector is rotated by the quaternion, so forward goes where you are LOOKING. Holds still
+            # when the sticks rest. The "Recenter" button returns the authored shot.
+            recenter = impulses.get("Recenter", 0.0) > 0.5
+            if recenter:
+                pad["cq"], pad["mv"] = VIEW_IDENTITY, [0.0, 0.0, 0.0]
+            # PERISCOPE (see PERISCOPE_FILE): switch ON + a fresh phone sample -> the camera IS the phone (relative to the
+            # pose at engage, so switching on never jumps; Recenter re-zeros: the authored shot = where the phone points now).
+            # The Look stick is superseded while it runs; Move still flies where you look.
+            # The remote's switch IS the on/off (user): ON spawns ~/bin/periscope-stream --once (the phone's sensors run
+            # only while it lives), OFF ends it -- it exits by itself within ~0.25 s, terminate() is the backstop.
+            peri_sw = bool(pwidgets.get("Periscope", {}).get("state"))
+            pp = pad.get("peri_proc")
+            if peri_sw and (pp is None or pp.poll() is not None) and time.time() - pad.get("peri_t", 0.0) > 2.0:
+                pad["peri_t"] = time.time()
+                try:
+                    with open(os.path.expanduser("~/.cache/shader-backdrop/periscope.log"), "a") as lf:
+                        pad["peri_proc"] = subprocess.Popen([os.path.expanduser("~/bin/periscope-stream"), "--once"],
+                                                            stdout=lf, stderr=lf, start_new_session=True)
+                except OSError as e:
+                    print(f"periscope: spawn failed: {e}", file=sys.stderr)
+            if peri_sw:
+                pad["peri_off_t"] = None
+            elif pp is not None:
+                if pad.get("peri_off_t") is None:
+                    pad["peri_off_t"] = time.time()
+                if pp.poll() is None and time.time() - pad["peri_off_t"] > 2.0:
+                    pp.terminate()               # it should have exited by itself; backstop (it releases the phone on TERM)
+                if pp.poll() is not None:
+                    pad["peri_proc"], pad["peri_off_t"] = None, None
+            peri_q = read_periscope() if peri_sw else None
+            if peri_q is None:
+                pad["peri_q0"] = None
+            else:
+                if pad["peri_q0"] is None or recenter:
+                    pad["peri_q0"], pad["peri_cq0"] = peri_q, pad["cq"]
+                q = quat_mul(pad["peri_cq0"], periscope_rel_cam(pad["peri_q0"], peri_q))
+                n = math.sqrt(sum(c * c for c in q)) or 1.0
+                pad["cq"] = tuple(c / n for c in q)
+                clx = cly = 0.0
+            if pad["alive"] > 0.5 and (clx or cly or cmx or cmy):
+                pdt = min(dt, PAD_STEER_DT_MAX)
+                dq = view_quat(math.degrees(clx * PAD_CAM_LOOK_RATE * pdt),
+                               math.degrees(cly * PAD_CAM_LOOK_RATE * pdt * PAD_STICK_Y_UP), 0.0)
+                q = quat_mul(pad["cq"], dq)
+                n = math.sqrt(sum(c * c for c in q)) or 1.0
+                pad["cq"] = tuple(c / n for c in q)
+                mvv = quat_rot(pad["cq"], (cmx, 0.0, cmy * PAD_STICK_Y_UP))
+                for i in range(3):
+                    pad["mv"][i] += mvv[i] * PAD_CAM_MOVE_RATE * pdt
+            # ---- THE MOUSE MODES (2026-10-19, the dwarf_box remote; user: "a toggle to switch desktop mouse into
+            # different modes bc I'm away from the keyboard and have just my phone"). The pad's "Mouse" dial
+            # (STEP_SLIDER 0..5) gives the PLAIN mouse -- the Cybersyn trackpad's real clicks -- the hand's jobs:
+            #   0 OFF    a normal desktop mouse (also: no dial on any pad)
+            #   1 BOOP   a click = one boop at the cursor (exactly Super + Alt tap: every hand shader gets it)
+            #   2 GRAB   the held button catches + flings (sims read inputs["mouse"]: dwarf_box)
+            #   3 LOOK   drag = turn the free camera (pad quaternion + the shared look-around camera)
+            #   4 FLY    drag = fly: up/down along the view, sideways strafes
+            #   5 METEOR a click = a meteor aimed at the cursor (sims read inputs["mouse"]: dwarf_box)
+            mm = max(0, min(5, int(round(pad_val(pwidgets, "Mouse"))))) if "Mouse" in pwidgets else 0
+            # (2026-10-19 py-spy: X round trips were 14 % of the main thread -- no query at all while the dial is OFF, and ONE
+            # query for both the button and the position while it is on)
+            mbtn, mxy = False, pad.get("m_prev") or (0.0, 0.0)
+            if mm:
+                try:
+                    qp = _xptr()
+                    mbtn = bool(qp.mask & 0x100)                                  # Button1Mask
+                    spec = OUTPUTS[0]
+                    for sp in OUTPUTS:
+                        if sp["x"] <= qp.root_x < sp["x"] + sp["w"] and sp["y"] <= qp.root_y < sp["y"] + sp["h"]:
+                            spec = sp
+                            break
+                    # the pointer -> canvas px through EXACTLY the blit's mapping (crop_for_spec + BLIT_FRAG): a landscape
+                    # head shows the portrait canvas QUARTER-TURNED, which the old straight crop ignored -- the mouse modes
+                    # missed the scene there (2026-10-19, user: "it doesn't seem to work on the landscape one")
+                    (ou, ov), (su, sv), rot = crop_for_spec(spec)
+                    vx = (qp.root_x - spec["x"]) / max(spec["w"], 1)
+                    vy = 1.0 - (qp.root_y - spec["y"]) / max(spec["h"], 1)
+                    tx, ty = (vy, 1.0 - vx) if rot > 0.5 else (vx, vy)
+                    mxy = (float((ou + tx * su) * CANVAS_W), float((ov + ty * sv) * CANVAS_H))
+                except Exception:
+                    pass
+            mpress = mbtn and not pad.get("m_btn", False)
+            if mm == 1 and mpress:
+                hand["boop"] += 1
+                hand["xy"] = mxy
+            if mm == 5 and mpress:
+                pad["m_met"] = pad.get("m_met", 0) + 1
+                pad["m_met_xy"] = mxy
+            if mm in (3, 4) and mbtn and pad.get("m_btn") and pad.get("m_prev") is not None:
+                ddx, ddy = mxy[0] - pad["m_prev"][0], mxy[1] - pad["m_prev"][1]
+                if mm == 3:
+                    dq = view_quat(math.degrees(ddx * MOUSE_LOOK_SENS), math.degrees(ddy * MOUSE_LOOK_SENS), 0.0)
+                    q = quat_mul(pad["cq"], dq)
+                    n = math.sqrt(sum(c * c for c in q)) or 1.0
+                    pad["cq"] = tuple(c / n for c in q)
+                    mouse_cam["yaw"] += ddx * MOUSE_LOOK_SENS
+                    mouse_cam["pitch"] += ddy * MOUSE_LOOK_SENS
+                else:
+                    mvv = quat_rot(pad["cq"], (ddx * MOUSE_MOVE_SENS, 0.0, ddy * MOUSE_MOVE_SENS))
+                    for i in range(3):
+                        pad["mv"][i] += mvv[i]
+                    mouse_cam["r"] += ddx * MOUSE_MOVE_SENS
+                    mouse_cam["f"] += ddy * MOUSE_MOVE_SENS
+                super_held = 1.0
+                set_uniform("u_steer", 1.0)
+            if mm != pad.get("m_mode"):
+                print("mouse mode: %s" % ("off", "boop", "grab", "look", "fly", "meteor")[mm], file=sys.stderr)
+                pad["m_mode"] = mm
+            pad["m_btn"], pad["m_prev"] = mbtn, mxy
+            mx2 = pad.get("m_met_xy", (0.0, 0.0))
+            pad["mouse"] = (float(mm), float(mxy[0]), float(mxy[1]), 1.0 if mbtn else 0.0,
+                            float(pad.get("m_met", 0)), float(mx2[0]), float(mx2[1]))
+            set_uniform("u_pad_look", (cam["yaw"], cam["pitch"], cam["roll"]))
+            set_uniform("u_pad_move", tuple(pad["mv"]))
+            set_uniform("u_pad_cam_q", pad["cq"])
+            # ---- PAD CROSSHAIR: the third stick ("boop") ------------------------------------
+            # The stick PLACES a reticle on the canvas and whatever drifts into it is flung
+            # ALONG THE RETICLE'S OWN RAY -- so a centred stick still means "straight away
+            # from me" (the classic poke) while an off-centre one throws things that way.
+            # Published as CANVAS PX, y up: the exact convention of the mouse's boop xy, so
+            # the shader draws it and sim.py rays it with the same code path, and the ghost
+            # of a cursor is the same number in both places.
+            #
+            # It is placed on the VISIBLE FRAME, not on the raw canvas: the canvas is square
+            # and the Pixel head is portrait, so the blit cover-crops about 28% of the canvas
+            # off each side (canvas_per_screen -- one uniform scale, no stretch). Mapping the
+            # stick to the raw canvas would throw the reticle off-screen at roughly half
+            # deflection; going through the SAME crop math the cursor uses (read_mouse_real)
+            # means full deflection lands exactly on the frame edge.
+            cbx, cby = pad_xy(pwidgets, "boop", pnow)
+            cactive = 1.0 if (abs(cbx) > PAD_BOOP_DEADZONE or abs(cby) > PAD_BOOP_DEADZONE) else 0.0
+            if pad["alive"] < 0.5:
+                cactive = 0.0          # phone gone: no reticle, nothing catches
+            pspec = OUTPUTS[0]         # the Pixel stream head: what the phone actually shows
+            pk = canvas_per_screen(pspec)
+            pcx = (CANVAS_W - pspec["w"] * pk) / 2.0
+            pcy = (CANVAS_H - pspec["h"] * pk) / 2.0
+            pad["boop"] = ((0.5 + 0.5 * cbx) * pspec["w"] * pk + pcx,
+                           CANVAS_H - ((0.5 - 0.5 * cby * PAD_STICK_Y_UP) * pspec["h"] * pk + pcy),
+                           cactive)
+            set_uniform("u_pad_boop", pad["boop"])
+            # ---- PAD SHOCKS / AURORA / SPEED (2026-10-15, remote variant) --------------------
+            # Two SWITCH GATES, three BUTTON FIRES and one STEP dial, for the widgets on the
+            # user's brown-dwarf pad. House rule applied to each: ON = the shader's own
+            # automatic system is ENGAGED, OFF = it is quiet. A BUTTON is an explicit press,
+            # so it is NOT gated by its switch -- that is what keeps "switched off" meaning
+            # quiet rather than broken, and it is the only way to fire while the switches sit
+            # at their power-on default (the app initialises every switch to off and only
+            # publishes on touch). Published as gates/edges/number only; the shader decides
+            # what a shock is.
+            pad["shocks"] = (pad_sw(pwidgets, "Dwarf Shocks"), pad_sw(pwidgets, "Moon Shocks"))
+            pad["fire"] = (impulses.get("Dwarf Big Shock", 0.0),
+                           impulses.get("Moon Shock", 0.0),
+                           impulses.get("Ring Aurora", 0.0))
+            pad["refill"] = impulses.get("refill", 0.0)
+            pad["star_tint"] = impulses.get("star_tint", 0.0)
+            pad["farm_off"] = pad_sw(pwidgets, "ring_farm_off")   # ringbox RING FARM OFF switch (2026-10-22)
+            pad["sliders"] = {k: pad_val_opt(pwidgets, k) for k in ("cam_mode", "sys_mode", "star_colour")}
+            pad["mode_fire"] = (impulses.get("mode_recover", 0.0),
+                                impulses.get("mode_rosette", 0.0))
+            # "Speed": a DroidPad STEP_SLIDER is a FLOAT over minValue..maxValue -- 0..10 here
+            # (its 5 steps sit between the ends, so there are 7 stops and the phone prints
+            # 5.00 dead centre). Half of it is therefore "the rate the shader was authored
+            # at": 0 = still, 5 = as authored, 10 = double. It publishes the MULTIPLIER, not
+            # the raw number, so no shader has to know where the middle of someone's slider is.
+            # An ABSENT dial publishes 1.0 and not 0.0: the app starts every slider at its
+            # MINIMUM, so "absent = 0" would freeze a shader the first time any pad carrying a
+            # Speed dial was even loaded.
+            pad["speed"] = (max(0.0, min(2.0, pad_val(pwidgets, "Speed") / 5.0))
+                            if (pwidgets.get("Speed") or {}).get("type") else 1.0)
+            set_uniform("u_pad_shocks", pad["shocks"])
+            set_uniform("u_pad_fire", pad["fire"])
+            set_uniform("u_pad_speed", pad["speed"])
+            # ---- SPECIAL THROTTLE (both behaviours live in the remote variant) --------------
+            # Shared rule: ON = the semi-regular throttle is ENGAGED. Switch "gate" (or "throttle"/"3").
+            # No such switch -> 0 = free-for-all. Read with the switch's own existence each frame (not
+            # "last value seen"): pads get swapped, and a general pad carries none of these, so a gate
+            # left latched by the last pad with one would otherwise stay shut with no widget to reopen.
+            gsw = max(pad_sw(pwidgets, "gate"), pad_sw(pwidgets, "throttle"), pad_sw(pwidgets, "3"))
+            pad["gate"] = (gsw if any((pwidgets.get(n) or {}).get("type") == "SWITCH"
+                                      for n in ("gate", "throttle", "3")) else 0.0)
+            set_uniform("u_pad_gate", pad["gate"])
+            set_uniform("u_pad_fly", (impulses.get("Normal Figure", 0.0),
+                                      impulses.get("Shadybusiness", 0.0),
+                                      impulses.get("Emitter", 0.0)))
+            set_uniform("u_pad_down", (float(pheld.get("Normal Figure", 0)),
+                                       float(pheld.get("Shadybusiness", 0)),
+                                       float(pheld.get("Emitter", 0))))
+            # ---- THE EMBER REMOTE (ctrl_ember_flock_v3, 2026-10-16) -------------------------
+            # A SEPARATE pad with its own widget ids, so the two remotes cannot cross. This is
+            # not redundant with the block above: the bridge's surface is the UNION of every pad
+            # touched since it started, keyed by widget id and LATCHED forever, so wiring
+            # ctrl_ember_flock_v3 to MyControlPad's ids (`Frenzy`, `Tilt`, `Pocket`, ...) meant
+            # the worms remote drove the flock for as long as it had been touched once. Under
+            # these ids the worms pad publishes nothing this shader reads, and vice versa.
+            # Same contracts as the block above: an ABSENT widget reads exactly where the app
+            # would leave an untouched one, and no dial may treat "absent" as "zero" unless zero
+            # is its real rest (see pads/README.md -- `Split` needs the -1 sentinel for that).
+            set_uniform("u_pad_e_tilt", pad_xy(pwidgets, "Plane", pnow))
+            set_uniform("u_pad_e_skew", pad_xy(pwidgets, "Skew", pnow))
+            # (There is deliberately NO water uniform here: user 2026-10-16 -- the flock with the
+            # mirror floor is the AUTO half, the REMOTE half is the blackhole variant, and the `off`
+            # switch's shader swap is what picks between them. Nothing keys off the sticks.)
+            # `Blaze` 3-stop dial, `Rose` pocket dial: same shapes as `Frenzy` / `Pocket`.
+            set_uniform("u_pad_e_blaze", (max(0.0, min(1.0, pad_val(pwidgets, "Blaze") / 10.0))
+                                          if pwidgets.get("Blaze") else 0.5))
+            set_uniform("u_pad_e_rose", max(0.0, min(1.0, pad_val(pwidgets, "Rose") / 10.0)))
+            # `Split`: the dial reads bottom = the two flocks act as ONE swarm, top = fully
+            # independent. Published as the merge amount (u_pad_e_one, 1 = one swarm), NOT the raw
+            # dial, for two reasons: the shader's rest then IS its zero, so no sentinel is needed,
+            # and an unpublished uniform (a renderer that does not know this name) reads 0 =
+            # independent, i.e. the plain desktop pair -- a safe degradation, where a `-1` sentinel
+            # scheme would have had a missing uniform silently merge the flock. `if present` is
+            # still required: absent reads 0, and 1 - 0 would be a full merge.
+            set_uniform("u_pad_e_one", (1.0 - max(0.0, min(1.0, pad_val(pwidgets, "Split") / 10.0))
+                                        if pwidgets.get("Split") else 0.0))
+            # `Align`: a MULTIPLIER on the music's own alignment weight, 0..10 -> 0..2 over the
+            # dial's 5 stops, so its centre (5) is "as authored" and an absent dial reads 1.0 --
+            # the same rest rule as `Speed` (a bare 0 in either would mean "no alignment at all").
+            set_uniform("u_pad_e_align", (max(0.0, min(2.0, pad_val(pwidgets, "Align") / 5.0))
+                                          if pwidgets.get("Align") else 1.0))
+            # `Solo` = one flock possessed at a time (rest 0 = both, the music's own frenzy);
+            # `Auto` = the music's own move pacing (rest 1 = auto, as `Auto Moves` above).
+            set_uniform("u_pad_e_solo", pad_sw(pwidgets, "Solo") if pwidgets.get("Solo") else 0.0)
+            set_uniform("u_pad_e_auto", pad_sw(pwidgets, "Auto") if pwidgets.get("Auto") else 1.0)
+            # Buttons are impulses this frame, so they are inherently id-keyed: nothing latches.
+            set_uniform("u_pad_e_fly", (impulses.get("Figure", 0.0),
+                                        impulses.get("Hawk", 0.0),
+                                        impulses.get("Special", 0.0)))
+            # ---- THE XBOX CONTROLLER (fishbox.mp, 2026-10-17; see GAMEPAD_FILE) --------------
+            # Published as themselves -- deflections, held buttons, press edges -- never a position
+            # or a command: the shader decides what a layer means (scope.md "NEW shader fishbox.mp").
+            xdoc = None
+            try:
+                xm = os.path.getmtime(GAMEPAD_FILE)
+                if time.time() - xm <= XB_STALE_S:
+                    if xm != xb["m"]:
+                        xb["m"] = xm
+                        with open(GAMEPAD_FILE) as fh:
+                            xb["doc"] = json.load(fh)
+                    xdoc = xb["doc"]
+            except (OSError, ValueError):
+                pass
+            xb["alive"] = 1.0 if xdoc else 0.0
+            xd = xdoc or {}
+            xbtn = xd.get("btn", {})
+            xpress = xd.get("press", {})
+
+            def xb_stick(key):
+                x, y = (xd.get(key) or [0.0, 0.0])[:2]
+                x = 0.0 if abs(x) < XB_DEADZONE else x
+                y = 0.0 if abs(y) < XB_DEADZONE else y
+                return (float(x), float(y) * XB_STICK_Y_UP)
+            # press EDGES: the bridge counts every press (it sees every event, we sample at frame
+            # rate); adopt the counters on the first read so a renderer restart replays nothing, and
+            # a counter that went backwards is a bridge restart -> the whole count is real presses.
+            if xb["prev_press"] is None and xdoc:
+                xb["prev_press"] = dict(xpress)
+            xtaps = {}
+            for k, n in xpress.items():
+                prev = (xb["prev_press"] or {}).get(k, 0)
+                d = n if n < prev else n - prev
+                if d > 0:
+                    xtaps[k] = float(d)
+            if xdoc:
+                xb["prev_press"] = dict(xpress)
+            if xtaps:
+                print("xb press: %s" % ", ".join(sorted(xtaps)), file=sys.stderr)
+
+            try:                                     # the layer map: the file wins when it exists and parses
+                mm = os.path.getmtime(GAMEPAD_MAP_FILE)
+                if mm != xb["map_m"]:
+                    xb["map_m"] = mm
+                    with open(GAMEPAD_MAP_FILE) as fh:
+                        doc = json.load(fh)
+                    xb["map"] = {s: dict(XB_LAYER_MAP[s], **doc.get(s, {})) for s in ("left", "right")}
+                    print("xb layer map: %s" % json.dumps(xb["map"], sort_keys=True), file=sys.stderr)
+            except (OSError, ValueError, TypeError):
+                pass
+
+            def xb_layer(side):
+                m = xb["map"][side]
+                if xbtn.get(m["lower"]):
+                    return 2.0
+                return 1.0 if xbtn.get(m["upper"]) else 0.0
+            set_uniform("u_xb_alive", xb["alive"])
+            set_uniform("u_xb_ls", xb_stick("ls"))
+            set_uniform("u_xb_rs", xb_stick("rs"))
+            set_uniform("u_xb_trig", (float(xd.get("lt", 0.0)), float(xd.get("rt", 0.0))))
+            set_uniform("u_xb_face", tuple(float(xbtn.get(k, 0)) for k in ("a", "b", "x", "y")))
+            set_uniform("u_xb_bump", (float(xbtn.get("lb", 0)), float(xbtn.get("rb", 0))))
+            set_uniform("u_xb_tap", (xtaps.get("lb", 0.0), xtaps.get("rb", 0.0),
+                                     xtaps.get("view", 0.0), xtaps.get("menu", 0.0)))
+            set_uniform("u_xb_layer", (xb_layer("left"), xb_layer("right")))
+            set_uniform("u_xb_hat", tuple(float(v) for v in (xd.get("hat") or [0, 0])[:2]))
+            # ---- GENERIC SPARE CONTROLS (the "general" pad, 2026-10-15) ----------------------
+            # DroidPad's remaining widget classes, published AS THEMSELVES, so any shader can use
+            # them without this file pretending to know what they mean. Same contract as the rest
+            # of the surface: a number or an angle, never a command, and a widget the CURRENT pad
+            # does not carry reads 0 -- exactly where the app leaves an untouched one.
+            #   "steering_wheel" -> u_pad_wheel, DEGREES, -(maxAngle)..+(maxAngle), where maxAngle is
+            #     the phone's own setting (360 on the general pad, whose wheel is freeRotation, so it
+            #     can pass a full turn either way). The app also SELF-CENTRES a released wheel: it
+            #     animates the angle back to 0 (verified in the bridge log -- a push to -196 degrees
+            #     swung back to 0 over ~0.9 s). So read it as an ANGLE and DIFF it for motion; an
+            #     integrator would wind the scene and then have it unwound by the phone at speed.
+            #   "slider" / "step_slider" -> u_pad_slider / u_pad_step, the RAW value in whatever
+            #     min..max the phone was configured with (the general pad's slider is 0..1, its step
+            #     slider 0..10 in 16 steps). Deliberately NOT normalised to 0..1: the event carries
+            #     no range (only the value), so guessing one would silently rescale somebody's dial.
+            #     NB the app sends a STEP_SLIDER as type "SLIDER" like any other -- the only thing
+            #     that survives the wire is the widget ID, so the two are told apart by name.
+            wheelw = pwidgets.get("steering_wheel") or {}
+            wheel_now = (float(wheelw.get("angle", 0.0))
+                         if wheelw.get("type") == "STEERING_WHEEL" else 0.0)
+            if pnow - float(wheelw.get("t", 0.0)) > PAD_STICK_TTL_S:
+                # A wheel nobody has refreshed has sprung back: 0 IS its resting angle, so a
+                # release that never arrived costs one unwind instead of a permanently rolled
+                # view -- and the next real turn still diffs correctly from 0. (An absent
+                # widget has no stamp at all, so this is also the "no wheel on this pad" case.)
+                wheel_now = 0.0
+            pad_slider, pad_step = pad_val(pwidgets, "slider"), pad_val(pwidgets, "step_slider")
+            set_uniform("u_pad_wheel", wheel_now)
+            set_uniform("u_pad_slider", pad_slider)
+            set_uniform("u_pad_step", pad_step)
+            # A one-line summary the first time each pad's WIDGET SET is seen, and whenever the two
+            # DERIVED dials move: which surface the renderer is really reading, and what the spare
+            # controls it does not interpret report. (The id list is the thing to check when a widget
+            # seems dead -- a typo in a widget's name is indistinguishable from a widget nobody
+            # touched, this side of the wire. `frenzy`/`pocket` are the 0..1 values actually published
+            # as u_pad_frenzy / u_pad_pocket, so the `Frenzy` and `Pocket` dials are traceable here.)
+            ids = ",".join(sorted(pwidgets))
+            seen = (ids, round(pad["frenzy"], 2), round(pad["pocket"], 2))
+            if seen != pad["ids"]:
+                pad["ids"] = seen
+                print("pad: %d widgets [%s] wheel=%.1f slider=%.3f step=%.3f frenzy=%.2f pocket=%.2f"
+                      % (len(pwidgets), ids, wheel_now, pad_slider, pad_step,
+                         pad["frenzy"], pad["pocket"]), file=sys.stderr)
+            if pad["alive"] > 0.5:
+                # The wheel is the one camera axis no stick can reach (ROLL), and it drives the SHARED
+                # camera as a DELTA, exactly like the phone gyro -- so the phone's own return animation
+                # unwinds precisely as much as the hand wound. (As a rate, a released full lock would
+                # instead spin every flying shader back at the wheel's return speed, ~1200 deg/s.)
+                d_deg = wheel_now - pad["wheel"]
+                if abs(d_deg) > 180.0:          # a reconnect or a jump rope, not a hand movement
+                    d_deg = 0.0
+                if d_deg:
+                    mouse_cam["roll"] += d_deg * PAD_WHEEL_ROLL_SENS
+                    # ...and the free camera's roll (2026-10-16). The free camera has no roll input at
+                    # all otherwise -- the pad's Look stick only does yaw/pitch -- so the wheel (finger
+                    # or the phone's tilt lane) is what tilts the horizon. It is the same delta the
+                    # legacy path just took, applied about the axis the quaternion camera actually
+                    # has: the view axis. An ATTITUDE, not a rate: the phone's lane sends the posture
+                    # it is holding, so levelling the phone levels the horizon again.
+                    dq = view_quat(0.0, 0.0, math.degrees(d_deg * PAD_WHEEL_ROLL_SENS) * PHONE_ROLL_SIGN)
+                    q = quat_mul(pad["cq"], dq)
+                    n = math.sqrt(sum(c * c for c in q)) or 1.0
+                    pad["cq"] = tuple(c / n for c in q)
+                    super_held = 1.0
+                    set_uniform("u_steer", 1.0)
+            pad["wheel"] = wheel_now
+            # ---- REMOTE TRIGGER: swap the shader for its remote-only variant ----------------
+            # (user 2026-10-15) "lets make the remote shaders just drive remote only shader variants,
+            # we settle for a prefix like ctrl_worms.mp ... hard cut doesnt matter ... just repurpose
+            # the off switch". A SWITCH named "off" picks between "<name>.mp" and "ctrl_<name>.mp" by
+            # writing active_shader.txt -- the pointer this renderer already watches -- so a swap is an
+            # ordinary shader reload (a HARD CUT: the context rebuilds and sim state resets, which the
+            # user explicitly does not mind). Switched off means the AUTO half, so this also works as
+            # "get me back out of the remote". Only acts when the sibling really exists, and only
+            # writes when the content actually has to change, so it never fights the prefs page or
+            # shader-mp-stage, and it does nothing at all on a pad without the switch.
+            offw = pwidgets.get("off") or {}
+            if offw.get("type") == "SWITCH" and pad["m"] != pad.get("off_m"):   # LEAN: only when pad.json changed
+                pad["off_m"] = pad["m"]
+                cur = read_active_shader_name()
+                pair = shader_pair(cur)
+                if pair:
+                    want = pair[1] if pad_sw(pwidgets, "off") > 0.5 else pair[0]
+                    if want != cur:
+                        write_active_shader_name(want)
+                        # A swap reloads the shader, so the sim state is gone anyway: put the pad's
+                        # own flight back to the authored framing too, or you would land looking out
+                        # from wherever you last flew. This is also the only "recentre" there is --
+                        # flip off and back on. (The pad has no widget for it in the dwarf profile.)
+                        pad["cam"] = {k: 0.0 for k in FREEFLY_KEYS}
+                        pad["cq"], pad["mv"] = VIEW_IDENTITY, [0.0, 0.0, 0.0]
+                        print("pad: remote trigger -> %s" % want, file=sys.stderr)
             set_uniform("u_cam_look", (mouse_cam["yaw"], mouse_cam["pitch"], mouse_cam["roll"]))
             set_uniform("u_cam_move", (mouse_cam["r"], mouse_cam["u"], mouse_cam["f"]))
             # Super+Z (i3 -> ~/bin/backdrop-autozoom) flips autozoom.txt: 0/1
+            slow_files = t2 - autozoom.get("t", 0.0) >= 0.25       # LEAN (2026-10-19): these 3 files 4x a second
+            if slow_files:
+                autozoom["t"] = t2
             try:
+                if not slow_files:
+                    raise _SkipCheck
                 az_m = os.path.getmtime(AUTOZOOM_FILE)
                 if az_m != autozoom["m"]:
                     autozoom["m"] = az_m
                     with open(AUTOZOOM_FILE) as fh:
                         autozoom["v"] = 1.0 if fh.read().strip() == "1" else 0.0
+            except _SkipCheck:
+                pass
             except (OSError, ValueError):
                 autozoom["v"] = 0.0
             set_uniform("u_autozoom", autozoom["v"])
             # dive path (~/bin/backdrop-dive -> cam_target.txt:
             # "re im zoom rot id"); the shader flies to it when the id changes
             try:
+                if not slow_files:
+                    raise _SkipCheck
                 ct_m = os.path.getmtime(CAM_TARGET_FILE)
                 if ct_m != cam_target["m"]:
                     cam_target["m"] = ct_m
@@ -2475,12 +3767,16 @@ def main():
                     if len(v) == 5:
                         cam_target["t"], cam_target["id"] = tuple(v[:4]), v[4]
                         print(f"cam target: {cam_target['t']} id {cam_target['id']:.0f}", file=sys.stderr)
+            except _SkipCheck:
+                pass
             except (OSError, ValueError):
                 pass
             set_uniform("u_cam_target", cam_target["t"])
             set_uniform("u_cam_target_id", cam_target["id"])
             # auto-dive (Super+Up): counted on the beat clock, like the flights
             try:
+                if not slow_files:
+                    raise _SkipCheck
                 ad_m = os.path.getmtime(AUTODIVE_FILE)
                 if ad_m != autodive["m"]:
                     autodive["m"] = ad_m
@@ -2490,6 +3786,8 @@ def main():
                         autodive["beats"] = AUTODIVE_BEATS      # first jump right away
                         autodive["last"], autodive["id"] = None, cam_target["id"]
                     autodive["on"] = on
+            except _SkipCheck:
+                pass
             except OSError:
                 autodive["on"] = False
             if autodive["on"]:
@@ -2542,9 +3840,11 @@ def main():
             # separation. The render loop just consumes the latest published
             # result at whatever rate it happens to be running -- which is the
             # whole point of moving the analysis upstream.
-            delayed, stems_arr, stem_scalars = audio_state[0]
+            delayed, stems_arr, stem_scalars, kick_arr = audio_state[0]
             if delayed is not None:
                 last_frame = delayed
+            if kick_arr is not None:
+                kick_tex.write(kick_arr.tobytes())
             if stems_arr is not None:
                 stems_tex.write(stems_arr.tobytes())
                 for sname, svalue in stem_scalars.items():
@@ -2676,8 +3976,53 @@ def main():
             render_start = time.monotonic()
             if mp is not None:
                 if mp.get("compute") is not None:
+                    mp["compute"].inputs = {"boop": hand["boop"], "boop_xy": hand["xy"], "reset": hand["reset"],
+                                            "canvas": (float(CANVAS_W), float(CANVAS_H)),
+                                            # pad flight + reticle: the SAME numbers the image pass
+                                            # gets, so a sim that mirrors the camera (brown_dwarf's
+                                            # mt_camera -> the boop ray) stays in lockstep with it.
+                                            "pad_look": (pad["cam"]["yaw"], pad["cam"]["pitch"],
+                                                         pad["cam"]["roll"]),
+                                            "pad_move": tuple(pad["mv"]),
+                                            "pad_cam_q": pad["cq"],
+                                            "pad_boop": pad["boop"],
+                                            "pad_alive": pad["alive"],
+                                            # the rest of the surface: the two shock GATES, the
+                                            # three fire EDGES (1 on the frame the press lands)
+                                            # and the Speed multiplier. The sim owns these --
+                                            # it fires the ambient bolts itself and hands the
+                                            # gates/edges on to the NOTES kernel and the aurora.
+                                            "pad_shocks": pad["shocks"],
+                                            "pad_fire": pad["fire"],
+                                            "pad_refill": pad["refill"],
+                                            "pad_star_tint": pad["star_tint"],
+                                            "pad_farm_off": pad.get("farm_off", 0.0),
+                                            "pad_sliders": pad.get("sliders", {}),
+                                            "pad_joy": pad.get("joy", {}),          # raw sticks by id (2026-10-23)
+                                            "xb": (xd if xdoc else {}),             # the Xbox controller (2026-10-23): gamepad.json as is, {} when gone
+                                            "pad_dpad": pad.get("dclicks", {}),     # dpad clicks this frame
+                                            "pad_mode": pad["mode_fire"],
+                                            "pad_speed": pad["speed"],
+                                            # THE MOUSE MODES: (mode, x, y, button held, meteor clicks, meteor x, y)
+                                            "mouse": pad.get("mouse", (0.0,) * 7),
+                                            # THE AUDIO SCALARS (u_kick, u_ms_*: the dict the shaders get), read-only, for
+                                            # CPU-side music reactions (2026-10-19, dwarf_box's chase: the swarm's hawk dash)
+                                            "audio": audio_state[0][2]}
+                    _ts = time.monotonic()
                     mp["compute"].step(dt, elapsed)
+                    seg_add("sim", (time.monotonic() - _ts) * 1000.0)
+                # The front/canvas render always sees the identity view, so a shader that declares
+                # u_view_q is unchanged for every head without a window.
+                try:
+                    mp["image_prog"]["u_view_q"].value = VIEW_IDENTITY
+                except KeyError:
+                    pass
+                try:
+                    mp["image_prog"]["u_view_fov"].value = 1.0
+                except KeyError:
+                    pass
                 render_multipass(ctx, mp, canvas_fbo, audio_channel_tex)
+                render_windows(ctx, mp, presenters, win_state, audio_channel_tex)
                 if mp["manifest"].get("persist") and elapsed - persist_last["t"] > PERSIST_SECONDS:
                     persist_last["t"] = elapsed
                     try:
@@ -2690,6 +4035,12 @@ def main():
                 canvas_fbo.use()
                 ctx.clear(0.0, 0.0, 0.0, 1.0)
                 vao.render(moderngl.TRIANGLE_STRIP)
+                # windows need a multipass Image pass; a single-pass shader shows the canvas as ever
+                for p in presenters:
+                    if p["view"] is not None:
+                        p["view"]["fbo"].release()
+                        p["view"]["tex"].release()
+                        p["view"] = None
             render_ms = (time.monotonic() - render_start) * 1000.0
 
             # Capture, before the presenters: canvas_fbo holds this frame and
@@ -2717,16 +4068,25 @@ def main():
                 p["last_present"] = now_present
                 glfw.make_context_current(p["window"])
                 p["ctx"].screen.use()
-                canvas_tex.use(location=0)  # shared GL namespace via `share=`
+                # A window head shows ITS canvas (same size, same crop rule), the rest the shared one.
+                (p["view"]["tex"] if p["view"] is not None else canvas_tex).use(location=0)  # shared GL namespace via `share=`
+                uv_off, uv_scl, uv_rot = p["uv_offset"], p["uv_scale"], p["uv_rot"]
                 p["prog"]["src_tex"].value = 0
-                p["prog"]["uv_offset"].value = p["uv_offset"]
-                p["prog"]["uv_scale"].value = p["uv_scale"]
-                p["prog"]["tap"].value = (0.25 * p["uv_scale"][0] / p["spec"]["w"],
-                                          0.25 * p["uv_scale"][1] / p["spec"]["h"])
+                p["prog"]["uv_offset"].value = uv_off
+                p["prog"]["uv_scale"].value = uv_scl
+                p["prog"]["uv_rot"].value = uv_rot
+                p["prog"]["tap"].value = (0.25 * uv_scl[0] / p["spec"]["w"],
+                                          0.25 * uv_scl[1] / p["spec"]["h"])
                 p["ctx"].clear(0.0, 0.0, 0.0, 1.0)
                 p["vao"].render(moderngl.TRIANGLE_STRIP)
+                _ts = time.monotonic()
                 glfw.swap_buffers(p["window"])
+                seg_add("swap_phone" if pi == 0 else "swap_dells", (time.monotonic() - _ts) * 1000.0)
             t5 = time.monotonic()
+            seg_add("poll", (t1 - t0) * 1000.0); seg_add("layout", (t2 - t1) * 1000.0)
+            seg_add("inputs", (render_start - frame_start) * 1000.0)
+            seg_add("draw", render_ms); seg_add("capture", (t4 - render_start) * 1000.0 - render_ms)
+            seg_add("present", (t5 - t4) * 1000.0)
 
             total_ms = (t5 - t0) * 1000.0
             if total_ms >= STALL_LOG_MS:
@@ -2752,6 +4112,7 @@ def main():
                     slack = frame_deadline - now_pace
                     if slack > 0.0005:
                         time.sleep(slack)
+                        seg_add("sleep", slack * 1000.0)
                     frame_deadline += period
                     if frame_deadline < time.monotonic() - period:
                         frame_deadline = time.monotonic() + period
@@ -2772,6 +4133,9 @@ def main():
                     f"render {perf_render_ms_sum / n:6.1f} ms",
                     file=sys.stderr,
                 )
+                print("perfseg: " + "  ".join(f"{k} {v / n:.1f}" for k, v in seg.items())
+                      + "  (ms per frame; draw includes sim, present includes the swaps)", file=sys.stderr)
+                seg.clear()
                 perf_last = now
                 perf_frames = 0
                 perf_frame_ms_sum = 0.0

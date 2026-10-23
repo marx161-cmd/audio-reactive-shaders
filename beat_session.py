@@ -23,6 +23,7 @@ import numpy as np
 import beat_cache
 import beat_track
 import nowplaying
+import song_features
 
 # Below this many recorded samples a song is not worth analysing (a skipped
 # track, or the tail of one that was already playing when the renderer started).
@@ -36,6 +37,9 @@ FULL_COVERAGE = 0.90
 # ...and its beats must stand clear of the average ODF (OPEN_THREADS 6b).
 # Garbage grids score ~0.06 at p99; real grids measured 0.14-0.26.
 CONF_MIN = 0.10
+# Phase-1 meter confidence gate (scope.md 2026-10-14): below this the analysed
+# bpb is not trusted for the bar lock (beat phase still steers).
+METER_CONF_GATE = 0.40
 # A `meta:` key is fuzzy, so the durations must agree before a stored map is
 # trusted. `yt:` and `file:` keys are exact and skip this.
 DURATION_TOL_S = 2.0
@@ -77,6 +81,7 @@ class BeatSession:
         self.np = nowplaying.NowPlaying().start() if enabled else None
         self._db_path = db_path
         self._db = None                # opened lazily, in the calling thread
+        self._feat_db = None           # song_features index (same file), lazily
 
         self.key = None
         self.track = None
@@ -85,7 +90,12 @@ class BeatSession:
         self._tainted = False          # a seek makes the recording unusable
         self._map = None               # (beat_times, median interval)
         self._map_meta = None
+        self._map_bpb = 0              # beats per bar, for the tracker's bar lock
+        self._map_bar0 = 0.0           # beat index of the first downbeat (mod bpb)
+        self._bar_db = None            # per-bar map: bar-start beat indices
+        self._bar_lock = None          # per-bar map: may this bar bar-lock
         self.last_status = "idle"
+        self._bg = []                  # in-flight re-analysis threads
 
     # -- lifecycle ----------------------------------------------------------
 
@@ -98,6 +108,10 @@ class BeatSession:
         if self.np:
             self.np.stop()
         self._finalise()
+        # _finalise hands the heavy work to a background thread; make sure the
+        # last song is actually stored before the DB/process goes away.
+        for t in self._bg:
+            t.join(timeout=20.0)
         if self._db is not None:
             self._db.close()
             self._db = None
@@ -146,8 +160,23 @@ class BeatSession:
         if self._map is not None:
             got = map_lookup(self._map[0], t, self._map[1])
             if got is not None:
-                _, phase, tbeat = got
-                self.tracker.set_reference(phase, tbeat)
+                count, phase, tbeat = got
+                # count/bar0/bpb let the tracker lock the count's INTEGER phase
+                # to the song's bars (not just the beat phase) -- see BAR_* in
+                # beat_track.py. Legacy live-learned maps have no bpb, so those
+                # steer beat phase only, exactly as before.
+                bpb, bar0 = self._map_bpb, self._map_bar0
+                if self._bar_db is not None and bpb > 1:
+                    # Per-bar map: lock only inside a bar the analysis marked
+                    # safe, anchored on THAT bar's "1" (so an odd bar earlier in
+                    # the song re-phases the count via the rate-only slew).
+                    k = int(np.searchsorted(self._bar_db, count, side="right")) - 1
+                    if 0 <= k < len(self._bar_db) and self._bar_lock[k] \
+                            and count < self._bar_db[k] + bpb:
+                        bar0 = float(self._bar_db[k] % bpb)
+                    else:
+                        bpb = 0
+                self.tracker.set_reference(phase, tbeat, count=count - bar0, bpb=bpb)
                 self.last_status = f"locked from cache ({self._map_meta['bpm']:.1f} BPM)"
         else:
             self.tracker.clear_reference()
@@ -167,12 +196,49 @@ class BeatSession:
         self._rec_t, self._rec_o = [], []
         self._tainted = False
         self._map = self._map_meta = None
+        self._map_bpb, self._map_bar0 = 0, 0.0
+        self._bar_db = self._bar_lock = None
 
         if track is None:
             track, _ = self.np.current()
         # Assign AFTER the fallback lookup, or a song begun from a 'start'
         # event (which carries only the key) is stored with no title/artist.
         self.track = track
+        # 2026-10-11: the offline song analysis (song_features.py, real audio,
+        # regularised beat_this grid) steers first; the old live-learned maps are
+        # only a fallback. Same smooth set_reference pull as before -- the live
+        # tracker keeps running (scope.md "ONE live-capable interface").
+        try:
+            if self._feat_db is None:
+                self._feat_db = song_features.connect(self._db_path or song_features.DB_PATH)
+            path = song_features.lookup(self._feat_db, key)
+            if path:
+                song = song_features.Song(path)
+                if song.beats.size >= 8:
+                    self._map = (song.beats, float(np.median(np.diff(song.beats))))
+                    self._map_meta = {"bpm": 60.0 / self._map[1], "method": "analysis",
+                                      "path": path}
+                    # Bar lock (2026-10-14): the beat-analyser's downbeats index
+                    # the beats (regularize_beats), so downbeat beats sit at
+                    # index `i0 % bpb`. Shifting the reference count by that lets
+                    # the tracker's integer phase land 0 on the "1".
+                    # Only bar-lock on a meter the analysis is CONFIDENT about
+                    # (scope.md 2026-10-14 Phase 1); an unconfirmed one leaves
+                    # bpb 0, so the tracker steers beat phase but no wrong bar.
+                    if song.meter_conf >= METER_CONF_GATE and song.bpb > 1:
+                        self._map_bpb = int(song.bpb)
+                        i0 = (int(np.searchsorted(song.beats, song.downbeats[0]))
+                              if song.downbeats.size else 0)
+                        self._map_bar0 = float(i0 % self._map_bpb)
+                        if song.bar_db_idx is not None and len(song.bar_db_idx):
+                            self._bar_db = song.bar_db_idx
+                            self._bar_lock = song.bar_lock
+                    else:
+                        self._map_bpb, self._map_bar0 = 0, 0.0
+                        self._bar_db = self._bar_lock = None
+                    return
+        except Exception:
+            pass
         try:
             db = self._db_conn()
             got = beat_cache.load_beatmap(db, key)
@@ -210,36 +276,58 @@ class BeatSession:
         self.key = self.track = None
         self._rec_t, self._rec_o = [], []
         self._map = self._map_meta = None
+        self._map_bpb, self._map_bar0 = 0, 0.0
+        self._bar_db = self._bar_lock = None
         self._tainted = False
         self.tracker.clear_reference()
 
         if key is None or tainted or len(ts) < MIN_RECORD_SAMPLES:
             return
-        out = beat_track.reanalyse(os_, ts,
-                                   duration_s=(track or {}).get("duration_s"))
-        if out is None:
-            return
-        beat_times, bpm, coverage, confidence = out
-        # Hard drop: an incomplete grid, or one whose beats do not stand clear
-        # of the ODF, is not stored at all -- the next listen re-learns it
-        # rather than recalling a fragment (OPEN_THREADS 6a/6b).
-        if coverage < FULL_COVERAGE or confidence < CONF_MIN:
-            self.last_status = (f"discarded: coverage {coverage:.0%}, "
-                                f"confidence {confidence:.2f}")
-            return
+        # The re-analysis (FFT autocorrelation + DP over the whole song) and the
+        # SQLite write are tens to ~100 ms -- far too long to sit on the audio
+        # reader thread, which calls this mid-stream at every song boundary
+        # (a visible stutter / dropped ODF samples right at the transition).
+        # Hand the captured recording to a short-lived daemon thread with its
+        # OWN DB connection: WAL is on, so it writes while the reader keeps
+        # running, and sqlite objects are not shareable across threads.
+        self._bg = [t for t in self._bg if t.is_alive()]
+        t = threading.Thread(target=self._reanalyse_and_store,
+                             args=(key, ts, os_, track),
+                             name="beat-reanalyse", daemon=True)
+        self._bg.append(t)
+        self.last_status = "analysing..."
+        t.start()
+
+    def _reanalyse_and_store(self, key, ts, os_, track):
+        """Runs OFF the audio reader thread. See _finalise()."""
         try:
-            db = self._db_conn()
-            tid = beat_cache.touch_track(
-                db, key,
-                source=(track or {}).get("player"),
-                title=(track or {}).get("title"),
-                artist=(track or {}).get("artist"),
-                album=(track or {}).get("album"),
-                duration_s=(track or {}).get("duration_s"),
-                count_play=True)
-            beat_cache.save_beatmap(db, tid, beat_times, bpm,
-                                    method="dp_live_odf", coverage=coverage,
-                                    confidence=confidence)
+            out = beat_track.reanalyse(os_, ts,
+                                       duration_s=(track or {}).get("duration_s"))
+            if out is None:
+                return
+            beat_times, bpm, coverage, confidence = out
+            # Hard drop: an incomplete grid, or one whose beats do not stand
+            # clear of the ODF, is not stored at all -- the next listen
+            # re-learns it rather than recalling a fragment (OPEN_THREADS 6a/6b).
+            if coverage < FULL_COVERAGE or confidence < CONF_MIN:
+                self.last_status = (f"discarded: coverage {coverage:.0%}, "
+                                    f"confidence {confidence:.2f}")
+                return
+            db = beat_cache.connect(self._db_path)
+            try:
+                tid = beat_cache.touch_track(
+                    db, key,
+                    source=(track or {}).get("player"),
+                    title=(track or {}).get("title"),
+                    artist=(track or {}).get("artist"),
+                    album=(track or {}).get("album"),
+                    duration_s=(track or {}).get("duration_s"),
+                    count_play=True)
+                beat_cache.save_beatmap(db, tid, beat_times, bpm,
+                                        method="dp_live_odf", coverage=coverage,
+                                        confidence=confidence)
+            finally:
+                db.close()
             self.last_status = f"learned {bpm:.1f} BPM ({len(beat_times)} beats)"
         except Exception as e:
             self.last_status = f"save failed: {e}"
@@ -287,6 +375,8 @@ def _selftest():
             # _finalise() is what stores the map, so read the status AFTER
             # it -- during playback the status is still "learning".
             s._finalise()
+            for t in s._bg:              # re-analysis now runs off-thread
+                t.join(timeout=20.0)
             status = s.last_status
             if s._db is not None:
                 s._db.close()

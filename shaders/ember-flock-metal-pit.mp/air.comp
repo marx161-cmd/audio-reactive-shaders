@@ -1,0 +1,639 @@
+uniform int   u_n;
+uniform float u_H;
+uniform float u_dt;
+
+ivec3 cellId() { return ivec3(gl_GlobalInvocationID); }
+bool outside(ivec3 p) { return any(lessThan(p, ivec3(0))) || any(greaterThanEqual(p, ivec3(u_n))); }
+float cellH() { return 2.0 * u_H / float(u_n); }
+vec3 cellPos(ivec3 p) { return ((vec3(p) + 0.5) / float(u_n) * 2.0 - 1.0) * u_H; }
+vec3 toUVW(vec3 x) { return x / (2.0 * u_H) + 0.5; }
+
+const ivec3 NB[6] = ivec3[6](ivec3(1, 0, 0), ivec3(-1, 0, 0), ivec3(0, 1, 0),
+                             ivec3(0, -1, 0), ivec3(0, 0, 1), ivec3(0, 0, -1));
+
+#define EPS        1e-3
+uniform float u_eps;
+
+#define VEL_TAU    2.2
+#define VISC_A     0.35
+#define STIR_N     64
+#define STIR_FIX   1000.0
+#define EMB_STIR   3.0
+#define EMB_W0     0.5
+#define BUOY       2.2
+#define BUOY_W0    0.6
+#define BUOY_ACC   1.5
+#define AIR_C_ACCENT 37
+#define FISH_STIR  4.0
+#define FISH_W0    0.5
+#define STIR_R     0.08
+#define STIR_RATE  10.0
+
+#if defined(K_MASK) || defined(K_ADV_FWD) || defined(K_ADV_CORR) || defined(K_FORCE) || defined(K_DIV) \
+ || defined(K_SMOOTH) || defined(K_MARK) || defined(K_RESTRICT) || defined(K_PROLONG) || defined(K_PROJECT)
+layout(local_size_x = 8, local_size_y = 8, local_size_z = 8) in;
+#endif
+
+#ifdef K_MASK
+layout(rgba16f, binding = 0) uniform writeonly image3D wallImg;
+layout(r16f,    binding = 1) uniform writeonly image3D maskImg;
+layout(rgba16f, binding = 2) uniform image3D velImg;
+void main() {
+    ivec3 p = cellId();
+    if (outside(p)) return;
+    bool fluid = all(greaterThan(p, ivec3(0))) && all(lessThan(p, ivec3(u_n - 1)));
+    imageStore(wallImg, p, vec4(0.0, 0.0, 0.0, fluid ? 1.0 : 0.0));
+    imageStore(maskImg, p, vec4(fluid ? 1.0 : 0.0));
+    if (!fluid) imageStore(velImg, p, vec4(0.0));
+}
+#endif
+
+#ifdef K_FORCE
+layout(rgba16f, binding = 0) uniform image3D velImg;
+layout(r32i,    binding = 1) uniform readonly iimage3D stirImg;
+uniform sampler2D u_ctl;
+void main() {
+    ivec3 p = cellId();
+    if (outside(p)) return;
+    vec4 v = imageLoad(velImg, p);
+    if (v.w < 0.5) return;
+    vec3 x = cellPos(p);
+    ivec3 sc = clamp(ivec3((x / (2.0 * u_H) + 0.5) * float(STIR_N)), ivec3(0), ivec3(STIR_N - 1));
+    float wf = float(imageLoad(stirImg, sc + ivec3(0, 0, 3 * STIR_N)).r) / STIR_FIX;
+    if (wf > 1e-3) {
+        vec3 vf = vec3(imageLoad(stirImg, sc).r, imageLoad(stirImg, sc + ivec3(0, 0, STIR_N)).r,
+                       imageLoad(stirImg, sc + ivec3(0, 0, 2 * STIR_N)).r) / STIR_FIX / wf;
+        float g = 1.0 - exp(-wf / EMB_W0);
+        v.xyz += (vf - v.xyz) * (1.0 - exp(-u_dt * EMB_STIR * g));
+        float acc = texelFetch(u_ctl, ivec2(AIR_C_ACCENT, 0), 0).r;
+        v.y += u_dt * BUOY * (1.0 + BUOY_ACC * acc) * (1.0 - exp(-wf / BUOY_W0));
+    }
+    {
+        v.xyz += (torVel(x) - v.xyz) * (1.0 - exp(-u_dt * TOR_K * torEnv(x) * smoothstep(0.7 * DISK_TOR_R, DISK_TOR_R, length(x))));
+    }
+    {
+        v.xyz += (holeSwirlVel(x) - v.xyz) * (1.0 - exp(-u_dt * HSW_K * holeSwirlEnv(x)));
+    }
+    {
+        v.xyz += (diskVel(x) - v.xyz) * (1.0 - exp(-u_dt * DISK_K * diskEnv(x)));
+    }
+    v.xyz *= exp(-u_dt / VEL_TAU);
+    imageStore(velImg, p, v);
+}
+#endif
+#ifdef K_ADV_FWD
+layout(rgba16f, binding = 0) uniform writeonly image3D outImg;
+uniform sampler3D u_src;
+uniform sampler3D u_vel;
+
+void main() {
+    ivec3 p = cellId();
+    if (outside(p)) return;
+    vec3 x = cellPos(p);
+    vec3 u = texelFetch(u_vel, p, 0).xyz;
+    imageStore(outImg, p, texture(u_src, toUVW(x - u_dt * u)));
+}
+#endif
+
+#ifdef K_ADV_CORR
+layout(rgba16f, binding = 0) uniform writeonly image3D outImg;
+layout(r16f,    binding = 1) uniform readonly image3D maskImg;
+uniform sampler3D u_src;
+uniform sampler3D u_fwd;
+uniform sampler3D u_vel;
+
+void main() {
+    ivec3 p = cellId();
+    if (outside(p)) return;
+    vec3 x = cellPos(p);
+    vec3 u = texelFetch(u_vel, p, 0).xyz;
+    vec4 fh = texelFetch(u_fwd, p, 0);
+    vec4 back = texture(u_fwd, toUVW(x + u_dt * u));
+    vec4 res = fh + 0.5 * (texelFetch(u_src, p, 0) - back);
+
+    vec3 g = toUVW(x - u_dt * u) * float(u_n) - 0.5;
+    ivec3 b0 = ivec3(floor(g));
+    vec4 lo = vec4(1e9), hi = vec4(-1e9);
+    for (int k = 0; k < 8; k++) {
+        ivec3 c = clamp(b0 + ivec3(k & 1, (k >> 1) & 1, k >> 2), ivec3(0), ivec3(u_n - 1));
+        vec4 v = texelFetch(u_src, c, 0);
+        lo = min(lo, v);
+        hi = max(hi, v);
+    }
+    res = clamp(res, lo, hi);
+    res.a = imageLoad(maskImg, p).r;
+    imageStore(outImg, p, res);
+}
+#endif
+
+#ifdef K_SMOOTH
+layout(r32f, binding = 0) uniform image3D qImg;
+layout(r32f, binding = 1) uniform readonly image3D bImg;
+layout(r16f, binding = 2) uniform readonly image3D mImg;
+uniform int u_parity;
+uniform int u_wallOnly;
+
+void main() {
+    ivec3 p = cellId();
+    if (outside(p)) return;
+    if (((p.x + p.y + p.z) & 1) != u_parity) return;
+    float mp = imageLoad(mImg, p).r;
+    if (mp < 0.5) return;
+    if (u_wallOnly == 1 && mp < 1.25) return;
+    float s = 0.0, cnt = 0.0;
+    for (int k = 0; k < 6; k++) {
+        ivec3 q = p + NB[k];
+        if (outside(q) || imageLoad(mImg, q).r < 0.5) continue;
+        s += imageLoad(qImg, q).r;
+        cnt += 1.0;
+    }
+    imageStore(qImg, p, vec4((s - imageLoad(bImg, p).r) / (cnt + u_eps)));
+}
+#endif
+
+#ifdef K_MARK
+layout(r16f, binding = 0) uniform image3D mImg;
+
+void main() {
+    ivec3 p = cellId();
+    if (outside(p)) return;
+    if (imageLoad(mImg, p).r < 0.5) return;
+    for (int k = 0; k < 6; k++) {
+        ivec3 q = p + NB[k];
+        if (outside(q) || imageLoad(mImg, q).r < 0.5) { imageStore(mImg, p, vec4(1.5)); return; }
+    }
+}
+#endif
+
+#ifdef K_RESTRICT
+layout(r32f, binding = 0) uniform readonly image3D qfImg;
+layout(r32f, binding = 1) uniform readonly image3D bfImg;
+layout(r16f, binding = 2) uniform readonly image3D mfImg;
+layout(r32f, binding = 3) uniform writeonly image3D qcImg;
+layout(r32f, binding = 4) uniform writeonly image3D bcImg;
+layout(r16f, binding = 5) uniform writeonly image3D mcImg;
+
+void main() {
+    ivec3 c = cellId();
+    if (outside(c)) return;
+    int nf = 2 * u_n;
+    float sumR = 0.0, sumM = 0.0;
+    for (int k = 0; k < 8; k++) {
+        ivec3 f = 2 * c + ivec3(k & 1, (k >> 1) & 1, k >> 2);
+        float m = imageLoad(mfImg, f).r;
+        sumM += min(m, 1.0);
+        if (m < 0.5) continue;
+        float qi = imageLoad(qfImg, f).r;
+        float s = 0.0, cnt = 0.0;
+        for (int j = 0; j < 6; j++) {
+            ivec3 q = f + NB[j];
+            if (any(lessThan(q, ivec3(0))) || any(greaterThanEqual(q, ivec3(nf)))) continue;
+            if (imageLoad(mfImg, q).r < 0.5) continue;
+            s += imageLoad(qfImg, q).r;
+            cnt += 1.0;
+        }
+        sumR += imageLoad(bfImg, f).r - (s - (cnt + u_eps) * qi);
+    }
+    imageStore(qcImg, c, vec4(0.0));
+    imageStore(bcImg, c, vec4(0.5 * sumR));
+    imageStore(mcImg, c, vec4(sumM / 8.0));
+}
+#endif
+
+#ifdef K_PROLONG
+layout(r32f, binding = 0) uniform image3D qfImg;
+layout(r16f, binding = 1) uniform readonly image3D mfImg;
+layout(r32f, binding = 2) uniform readonly image3D qcImg;
+layout(r16f, binding = 3) uniform readonly image3D mcImg;
+
+void main() {
+    ivec3 p = cellId();
+    if (outside(p)) return;
+    if (imageLoad(mfImg, p).r < 0.5) return;
+    int nc = u_n / 2;
+    ivec3 c0 = p / 2;
+    ivec3 o = 2 * (p & 1) - 1;
+    float sum = 0.0, wsum = 0.0;
+    for (int k = 0; k < 8; k++) {
+        ivec3 sel = ivec3(k & 1, (k >> 1) & 1, k >> 2);
+        ivec3 c = c0 + sel * o;
+        if (any(lessThan(c, ivec3(0))) || any(greaterThanEqual(c, ivec3(nc)))) continue;
+        if (imageLoad(mcImg, c).r < 0.5) continue;
+        vec3 w3 = mix(vec3(0.75), vec3(0.25), vec3(sel));
+        float w = w3.x * w3.y * w3.z;
+        sum += w * imageLoad(qcImg, c).r;
+        wsum += w;
+    }
+    if (wsum > 0.0) imageStore(qfImg, p, vec4(imageLoad(qfImg, p).r + sum / wsum));
+}
+#endif
+
+#ifdef K_PROJECT
+layout(rgba16f, binding = 0) uniform image3D velImg;
+layout(r32f,    binding = 1) uniform readonly image3D qImg;
+layout(rgba16f, binding = 2) uniform readonly image3D wallImg;
+
+void main() {
+    ivec3 p = cellId();
+    if (outside(p)) return;
+    vec4 w = imageLoad(wallImg, p);
+    if (w.w < 0.5) { imageStore(velImg, p, vec4(w.xyz, 0.0)); return; }
+    float qc = imageLoad(qImg, p).r;
+    float qn[6];
+    for (int k = 0; k < 6; k++) {
+        ivec3 q = p + NB[k];
+        qn[k] = (!outside(q) && imageLoad(wallImg, q).w > 0.5) ? imageLoad(qImg, q).r : qc;
+    }
+    vec4 v = imageLoad(velImg, p);
+    v.xyz -= 0.5 * vec3(qn[0] - qn[1], qn[2] - qn[3], qn[4] - qn[5]);
+    imageStore(velImg, p, v);
+}
+#endif
+
+#ifdef K_DIV
+layout(local_size_x = 8, local_size_y = 8, local_size_z = 8) in;
+layout(r32f,    binding = 0) uniform writeonly image3D bImg;
+layout(rgba16f, binding = 1) uniform readonly image3D velImg;
+layout(rgba16f, binding = 2) uniform readonly image3D wallImg;
+vec3 uAt(ivec3 q) {
+    if (outside(q)) return vec3(0.0);
+    vec4 w = imageLoad(wallImg, q);
+    return w.w > 0.5 ? imageLoad(velImg, q).xyz : w.xyz;
+}
+void main() {
+    ivec3 p = cellId();
+    if (outside(p)) return;
+    if (imageLoad(wallImg, p).w < 0.5) { imageStore(bImg, p, vec4(0.0)); return; }
+    float D = 0.5 * ((uAt(p + NB[0]).x - uAt(p + NB[1]).x)
+                   + (uAt(p + NB[2]).y - uAt(p + NB[3]).y)
+                   + (uAt(p + NB[4]).z - uAt(p + NB[5]).z));
+    imageStore(bImg, p, vec4(D));
+}
+#endif
+
+#ifdef K_VISC
+layout(local_size_x = 8, local_size_y = 8, local_size_z = 8) in;
+layout(rgba16f, binding = 0) uniform writeonly image3D dstImg;
+uniform sampler3D u_src;
+void main() {
+    ivec3 p = cellId();
+    if (outside(p)) return;
+    vec4 c = texelFetch(u_src, p, 0);
+    if (c.w < 0.5) { imageStore(dstImg, p, c); return; }
+    vec3 s = vec3(0.0);
+    float n = 0.0;
+    for (int k = 0; k < 6; k++) {
+        ivec3 q = p + NB[k];
+        if (outside(q)) continue;
+        vec4 o = texelFetch(u_src, q, 0);
+        if (o.w < 0.5) continue;
+        s += o.xyz; n += 1.0;
+    }
+    if (n > 0.0) c.xyz += (s / n - c.xyz) * VISC_A;
+    imageStore(dstImg, p, c);
+}
+#endif
+#define SMOKE_EMIT   0.80
+#define SMOKE_TAU    3.0
+#define SMOKE_MAX    20.0
+#define SMOKE_SIGMA  1.00
+#define SMOKE_STEPS  128
+#define SMOKE_RISE   0.10
+#define SMOKE_DIR_UP 0
+#define SMOKE_POOL   1
+#define POOL_DRIFT   0.80
+#define POOL_AIR_K   0.12
+#define POOL_FULL    3.0
+#define POOL_TAU     8.0
+#define TAU_FREE     2.5
+#define POOL_WALL    0.15
+#define SMOKE_RISE_UP 0.25
+#define SMOKE_UP_K   0.20
+#define SMOKE_VENT_D 0.60
+#define SMOKE_VENT_K 2.50
+#ifdef K_SMOKE
+layout(local_size_x = 8, local_size_y = 8, local_size_z = 8) in;
+layout(r16f, binding = 0) uniform writeonly image3D outImg;
+layout(r32i, binding = 1) uniform readonly iimage3D stirImg;
+uniform sampler3D u_smk;
+uniform sampler3D u_vel;
+#define SMK_TURB_V    0.30
+#define SMK_TURB_S    5.0
+#define SMK_TURB_T    0.35
+#define SMK_TURB_U0   0.05
+#define SMK_TURB_U1   0.60
+#define SMK_TURB_MIN  0.20
+float tb_hash(vec3 p) { p = fract(p * 0.1031); p += dot(p, p.zyx + 31.32); return fract((p.x + p.y) * p.z); }
+float tb_noise(vec3 x) {
+    vec3 i = floor(x), f = fract(x); f = f * f * (3.0 - 2.0 * f);
+    return mix(mix(mix(tb_hash(i), tb_hash(i + vec3(1, 0, 0)), f.x), mix(tb_hash(i + vec3(0, 1, 0)), tb_hash(i + vec3(1, 1, 0)), f.x), f.y),
+               mix(mix(tb_hash(i + vec3(0, 0, 1)), tb_hash(i + vec3(1, 0, 1)), f.x), mix(tb_hash(i + vec3(0, 1, 1)), tb_hash(i + vec3(1, 1, 1)), f.x), f.y), f.z);
+}
+vec3 tb_pot(vec3 q) { return vec3(tb_noise(q), tb_noise(q + vec3(31.4, 17.1, 5.3)), tb_noise(q + vec3(-12.7, 47.9, 23.1))); }
+vec3 tb_curl(vec3 q) {
+    const float e = 0.25;
+    vec3 px0 = tb_pot(q - vec3(e, 0, 0)), px1 = tb_pot(q + vec3(e, 0, 0));
+    vec3 py0 = tb_pot(q - vec3(0, e, 0)), py1 = tb_pot(q + vec3(0, e, 0));
+    vec3 pz0 = tb_pot(q - vec3(0, 0, e)), pz1 = tb_pot(q + vec3(0, 0, e));
+    return vec3((py1.z - py0.z) - (pz1.y - pz0.y), (pz1.x - pz0.x) - (px1.z - px0.z), (px1.y - px0.y) - (py1.x - py0.x)) / (2.0 * e);
+}
+float stirEmit(vec3 x) {
+    vec3 g = toUVW(x) * float(STIR_N) - 0.5;
+    ivec3 b = ivec3(floor(g));
+    vec3 f = g - vec3(b);
+    float e = 0.0;
+    for (int k = 0; k < 8; k++) {
+        ivec3 o = ivec3(k & 1, (k >> 1) & 1, k >> 2);
+        ivec3 c = clamp(b + o, ivec3(0), ivec3(STIR_N - 1));
+        vec3 w3 = mix(1.0 - f, f, vec3(o));
+        e += w3.x * w3.y * w3.z * float(imageLoad(stirImg, c + ivec3(0, 0, 4 * STIR_N)).r);
+    }
+    return e / STIR_FIX;
+}
+void main() {
+    ivec3 p = cellId();
+    if (outside(p)) return;
+    vec3 x = cellPos(p);
+    vec3 toCam = transpose(camRot()) * vec3(0.0, 0.0, -1.0);
+    vec3 ua = texture(u_vel, toUVW(x)).xyz;
+#if SMOKE_POOL
+    vec3 away = -toCam;
+    float zc = dot(x - vec3(0.0, CAM_TY, 0.0), away);
+    float hC = 2.0 * u_H / float(u_n);
+    float dBehind = texture(u_smk, toUVW(x + away * hC)).r;
+    float fullB = smoothstep(0.7, 1.0, dBehind / POOL_FULL);
+    float wallF = smoothstep(0.0, POOL_WALL, BOX_ZB - zc);
+    vec3 xs = x - u_dt * (POOL_AIR_K * ua + POOL_DRIFT * away * (1.0 - fullB) * wallF);
+#elif SMOKE_DIR_UP
+    vec3 xs = x - u_dt * (ua + vec3(0.0, SMOKE_RISE_UP, 0.0));
+#else
+    ua.y *= SMOKE_UP_K;
+    vec3 xs = x - u_dt * (ua + SMOKE_RISE * toCam);
+#endif
+    {
+        float act = mix(SMK_TURB_MIN, 1.0, smoothstep(SMK_TURB_U0, SMK_TURB_U1, length(ua)));
+        vec3 q = x * SMK_TURB_S + vec3(0.0, 1.0, 0.7) * SMK_TURB_T * u_time;
+        vec3 uT = tb_curl(q) + 0.5 * tb_curl(q * 2.3 + vec3(5.1, -3.3, 9.7) - vec3(0.8, 0.0, 0.5) * SMK_TURB_T * u_time);
+        xs -= u_dt * SMK_TURB_V * act * uT;
+    }
+    float d = all(lessThan(abs(xs), vec3(u_H))) ? texture(u_smk, toUVW(xs)).r : 0.0;
+    float near = dot(x - swarmCentre(), toCam);
+#if SMOKE_POOL
+    float tauS = mix(TAU_FREE, POOL_TAU, smoothstep(0.5, 1.0, d / POOL_FULL));
+    float ventD = SWARM_Z - BOX_ZN - 0.35;
+    d *= exp(-u_dt / tauS - u_dt * SMOKE_VENT_K * smoothstep(ventD, ventD + 0.3, near));
+#else
+    d *= exp(-u_dt / SMOKE_TAU - u_dt * SMOKE_VENT_K * smoothstep(SMOKE_VENT_D, SMOKE_VENT_D + 0.8, near));
+#endif
+    float e = stirEmit(x);
+    d += SMOKE_EMIT * u_dt * e;
+    imageStore(outImg, p, vec4(clamp(d, 0.0, SMOKE_MAX)));
+}
+#endif
+#ifdef K_SMOKE_RAY
+layout(local_size_x = 8, local_size_y = 8) in;
+layout(rgba16f, binding = 0) uniform writeonly image2D outImg;
+uniform sampler3D u_smk;
+uniform vec2 u_res;
+uniform sampler2D u_flk;
+#define SMK_LV        0
+#define LV_N_F       128.0
+uniform sampler3D u_lvN;
+uniform sampler3D u_lvW;
+#define LV_KN         0.10
+#define LV_KW         8.00
+#define LV_HG_G       0.70
+#define LV_DIR_K      2.5
+#define LV_SHADOW_N   6
+#define LV_SHADOW_DS  0.10
+#define LV_BB_T_COLD 1000.0
+#define LV_BB_T_SPAN 2600.0
+#define LV_BB_HEAT_P 1.15
+#define LV_BB_T_REF 2800.0
+#define LV_BB_SB_EXP 4.0
+#define LV_BB_L_MIN 0.18
+#define LV_BB_L_MAX 6.0
+vec2 lv_bbLocus(float T) {
+    if (T < 1667.0) {
+        T = max(T, 1000.0);
+        float u = (0.860117757 + 1.54118254e-4 * T + 1.28641212e-7 * T * T) / (1.0 + 8.42420235e-4 * T + 7.08145163e-7 * T * T);
+        float v = (0.317398726 + 4.22806245e-5 * T + 4.20481691e-8 * T * T) / (1.0 - 2.89741816e-5 * T + 1.61456053e-7 * T * T);
+        float d = 2.0 * u - 8.0 * v + 4.0;
+        return vec2(3.0 * u / d, 2.0 * v / d);
+    }
+    T = clamp(T, 1667.0, 25000.0);
+    float t2 = T * T, t3 = t2 * T;
+    float x = (T < 4000.0)
+        ? (-0.2661239e9 / t3 - 0.2343589e6 / t2 + 0.8776956e3 / T + 0.179910)
+        : (-3.0258469e9 / t3 + 2.1070379e6 / t2 + 0.2226347e3 / T + 0.240390);
+    float y = (T < 2222.0)
+        ? (-1.1063814 * x * x * x - 1.34811020 * x * x + 2.18555832 * x - 0.20219683)
+        : ((T < 4000.0)
+            ? (-0.9549476 * x * x * x - 1.37418593 * x * x + 2.09137015 * x - 0.16748867)
+            : (3.0817580 * x * x * x - 5.87338670 * x * x + 3.75112997 * x - 0.37001483));
+    return vec2(x, y);
+}
+vec3 lv_bbLinear(float T) {
+    vec2 xy = lv_bbLocus(T);
+    vec3 XYZ = vec3(xy.x / xy.y, 1.0, (1.0 - xy.x - xy.y) / xy.y);
+    vec3 rgb = vec3( 3.2404542 * XYZ.x - 1.5371385 * XYZ.y - 0.4985314 * XYZ.z,
+                    -0.9692660 * XYZ.x + 1.8760108 * XYZ.y + 0.0415560 * XYZ.z,
+                     0.0556434 * XYZ.x - 0.2040259 * XYZ.y + 1.0572252 * XYZ.z);
+    rgb = max(rgb, vec3(0.0));
+    return rgb / max(max(rgb.r, max(rgb.g, rgb.b)), 1e-5);
+}
+#define SMK_LIGHT_R   0.70
+#define SMK_NOISE_S   3.0
+#define SMK_NOISE_K   2.20
+#define SMK_NOISE_V   0.12
+#define SMK_SHADOW_N  4
+#define SMK_SHADOW_DS 0.12
+#define SMK_SHADOW_K  1.0
+float hash13(vec3 p) { p = fract(p * 0.1031); p += dot(p, p.zyx + 31.32); return fract((p.x + p.y) * p.z); }
+float vnoise(vec3 x) {
+    vec3 i = floor(x), f = fract(x); f = f * f * (3.0 - 2.0 * f);
+    return mix(mix(mix(hash13(i), hash13(i + vec3(1, 0, 0)), f.x), mix(hash13(i + vec3(0, 1, 0)), hash13(i + vec3(1, 1, 0)), f.x), f.y),
+               mix(mix(hash13(i + vec3(0, 0, 1)), hash13(i + vec3(1, 0, 1)), f.x), mix(hash13(i + vec3(0, 1, 1)), hash13(i + vec3(1, 1, 1)), f.x), f.y), f.z);
+}
+void main() {
+    ivec2 q = ivec2(gl_GlobalInvocationID.xy);
+    ivec2 sz = imageSize(outImg);
+    if (any(greaterThanEqual(q, sz))) return;
+    vec2 frag = (vec2(q) + 0.5) / vec2(sz) * u_res;
+    vec2 uv = (2.0 * frag - u_res) / u_res.y;
+    mat3 Rt = transpose(camRot());
+    float t0 = max(CAM_D + BOX_ZN, 0.3), t1 = min(CAM_D + 1.75 * u_H, CAM_D + BOX_ZB);
+    float ds = (t1 - t0) / float(SMOKE_STEPS), tau = 0.0;
+    vec4 F0 = texelFetch(u_flk, ivec2(0, 0), 0), F1 = texelFetch(u_flk, ivec2(1, 0), 0);
+    float w0 = F0.w + SMK_LIGHT_R, w1 = F1.w + SMK_LIGHT_R;
+    vec3 drift = vec3(0.0, 1.0, 0.6) * SMK_NOISE_V * u_time;
+    float Tacc = 1.0, Ls = 0.0;
+    vec3 LsC = vec3(0.0);
+    vec3 rdW = normalize(Rt * vec3(uv / FOCAL - vec2(0.0, EYE_Y) / (CAM_D + EYE_ZN), 1.0));
+    for (int i = 0; i < SMOKE_STEPS; i++) {
+        float t = t0 + (float(i) + 0.5) * ds;
+        vec3 pw = Rt * vec3(uv * t / FOCAL + vec2(0.0, EYE_Y) * (1.0 - t / (CAM_D + EYE_ZN)), t - CAM_D) + vec3(0.0, CAM_TY, 0.0);
+        if (!all(lessThan(abs(pw), vec3(u_H)))) continue;
+        float dn = texture(u_smk, toUVW(pw)).r;
+        if (dn <= 1e-4) continue;
+        vec3 np = pw * SMK_NOISE_S - drift;
+        float nz = 0.55 * vnoise(np) + 0.30 * vnoise(np * 2.03 + 7.1) + 0.15 * vnoise(np * 4.11 + 3.3);
+        dn *= max(0.0, 1.0 + SMK_NOISE_K * (nz - 0.5) * 2.0 * 0.5);
+        float dTau = SMOKE_SIGMA * dn * ds;
+#if SMK_LV
+        {
+            vec3 uvw = toUVW(pw);
+            vec2 lt = LV_KN * texture(u_lvN, uvw).xy + LV_KW * texture(u_lvW, uvw).xy;
+            if (lt.x > 1e-4) {
+                float hT = 1.5 / float(LV_N_F);
+                vec3 g = vec3(texture(u_lvW, uvw + vec3(hT, 0, 0)).x - texture(u_lvW, uvw - vec3(hT, 0, 0)).x,
+                              texture(u_lvW, uvw + vec3(0, hT, 0)).x - texture(u_lvW, uvw - vec3(0, hT, 0)).x,
+                              texture(u_lvW, uvw + vec3(0, 0, hT)).x - texture(u_lvW, uvw - vec3(0, 0, hT)).x);
+                float gl = length(g), lwI = texture(u_lvW, uvw).x;
+                vec3 sd = gl > 1e-7 ? g / gl : -rdW;
+                float dirK = clamp(LV_DIR_K * gl / max(lwI, 1e-6), 0.0, 1.0);
+                float sh = 0.0;
+                for (int k = 1; k <= LV_SHADOW_N; k++) {
+                    vec3 ps = pw + sd * (float(k) * LV_SHADOW_DS);
+                    float dsn = texture(u_smk, toUVW(ps)).r;
+                    dsn *= max(0.0, 1.0 + SMK_NOISE_K * (vnoise(ps * SMK_NOISE_S - drift) - 0.5));
+                    sh += dsn;
+                }
+                float Tsh = exp(-SMOKE_SIGMA * SMK_SHADOW_K * sh * LV_SHADOW_DS);
+                float cth = dot(sd, rdW);
+                float gg = LV_HG_G * LV_HG_G;
+                float hg = (1.0 - gg) / pow(1.0 + gg - 2.0 * LV_HG_G * cth, 1.5);
+                float heat = clamp(lt.y / lt.x, 0.0, 1.0);
+                float T = LV_BB_T_COLD + LV_BB_T_SPAN * pow(heat, LV_BB_HEAT_P);
+                vec3 Lc = lv_bbLinear(T) * clamp(pow(T / LV_BB_T_REF, LV_BB_SB_EXP), LV_BB_L_MIN, LV_BB_L_MAX) * lt.x;
+                LsC += Tacc * (1.0 - exp(-dTau)) * Lc * Tsh * mix(1.0, hg, dirK);
+            }
+        }
+        Tacc *= exp(-dTau);
+        tau += dTau;
+        continue;
+#endif
+        vec3 d0 = pw - F0.xyz, d1 = pw - F1.xyz;
+        float l0 = exp(-dot(d0, d0) / (2.0 * w0 * w0)), l1 = exp(-dot(d1, d1) / (2.0 * w1 * w1));
+        float lit = 0.0;
+        {
+            for (int f = 0; f < 2; f++) {
+                float lf = (f == 0) ? l0 : l1;
+                if (lf < 1e-3) continue;
+                vec3 sd = normalize(((f == 0) ? F0.xyz : F1.xyz) - pw);
+                float sh = 0.0;
+                for (int k = 1; k <= SMK_SHADOW_N; k++) {
+                    vec3 ps = pw + sd * (float(k) * SMK_SHADOW_DS);
+                    float dsn = texture(u_smk, toUVW(ps)).r;
+                    dsn *= max(0.0, 1.0 + SMK_NOISE_K * (vnoise(ps * SMK_NOISE_S - drift) - 0.5));
+                    sh += dsn;
+                }
+                lit += lf * exp(-SMOKE_SIGMA * SMK_SHADOW_K * sh * SMK_SHADOW_DS);
+            }
+        }
+        Ls += Tacc * (1.0 - exp(-dTau)) * lit;
+        Tacc *= exp(-dTau);
+        tau += dTau;
+    }
+#if SMK_LV
+    imageStore(outImg, q, vec4(tau, LsC));
+#else
+    imageStore(outImg, q, vec4(tau, Ls * vec3(1.0, 0.22, 0.04)));
+#endif
+}
+#endif
+#ifdef K_SCLEAR
+layout(local_size_x = 8, local_size_y = 8, local_size_z = 8) in;
+layout(r32i, binding = 0) uniform writeonly iimage3D stirImg;
+void main() {
+    ivec3 p = ivec3(gl_GlobalInvocationID);
+    if (any(greaterThanEqual(p, ivec3(STIR_N, STIR_N, 5 * STIR_N)))) return;
+    imageStore(stirImg, p, ivec4(0));
+}
+#endif
+
+#define LV_FIX       1000.0
+#ifdef K_LSPLAT
+layout(local_size_x = 64) in;
+layout(r32ui, binding = 0) uniform uimage3D lvU;
+uniform sampler2D u_boid;
+uniform sampler2D u_spk;
+#define LV_EMB_W      1.00
+#define LV_SPK_W      0.15
+#define LV_SPK_N      16384
+#define LV_HEAT_MIN   0.18
+void splatL(vec3 x, float I, float heat) {
+    if (I <= 1e-5) return;
+    vec3 g = toUVW(x) * float(u_n) - 0.5;
+    ivec3 b = ivec3(floor(g));
+    vec3 f = g - vec3(b);
+    for (int k = 0; k < 8; k++) {
+        ivec3 o = ivec3(k & 1, (k >> 1) & 1, k >> 2);
+        ivec3 c = b + o;
+        if (outside(c)) continue;
+        vec3 w3 = mix(1.0 - f, f, vec3(o));
+        float w = w3.x * w3.y * w3.z * I;
+        imageAtomicAdd(lvU, c, uint(w * LV_FIX + 0.5));
+        imageAtomicAdd(lvU, c + ivec3(0, 0, u_n), uint(w * heat * LV_FIX + 0.5));
+    }
+}
+void main() {
+    int i = int(gl_GlobalInvocationID.x);
+    if (i < N_ALL) {
+        if (i % N_PER == 0) return;
+        vec4 P = texelFetch(u_boid, ivec2(i, 0), 0), V = texelFetch(u_boid, ivec2(i, 1), 0), Lf = texelFetch(u_boid, ivec2(i, 2), 0);
+        if (Lf.x <= 0.0) return;
+        float fastE = smoothstep(0.90, 3.00, length(V.xyz));
+        float seed = float(i) + V.w * 1000.0;
+        float heat0 = 0.55 - 0.22 * (fract(seed * 0.3819660) - 0.35) * 2.0 + 0.10 * fract(seed * 0.7548776);
+        heat0 = clamp(heat0 + 0.15 * fastE, 0.0, 1.0);
+        splatL(P.xyz, LV_EMB_W * Lf.x * (1.0 + 0.35 * fastE), clamp(max(heat0, LV_HEAT_MIN) * Lf.y, 0.0, 1.0));
+        return;
+    }
+    int j = i - N_ALL;
+    if (j >= LV_SPK_N) return;
+    vec4 P = texelFetch(u_spk, ivec2(j, 0), 0), V = texelFetch(u_spk, ivec2(j, 1), 0);
+    if (V.w <= 0.0 || P.w >= V.w) return;
+    float x = P.w / V.w;
+    float fade = x < 0.55 ? 1.0 - 0.15 * x / 0.55 : 0.85 * (1.0 - (x - 0.55) / 0.45);
+    float h1 = fract(float(j) * 0.6180339);
+    float heat = clamp(mix(mix(0.50, 0.70, h1), 0.04, pow(x, 0.9)), 0.0, 1.0);
+    splatL(P.xyz, LV_SPK_W * fade, heat);
+}
+#endif
+#ifdef K_LRESOLVE
+layout(local_size_x = 8, local_size_y = 8, local_size_z = 8) in;
+layout(r32ui, binding = 0) uniform uimage3D lvU;
+layout(rg16f, binding = 1) uniform writeonly image3D lvOut;
+void main() {
+    ivec3 p = cellId();
+    if (outside(p)) return;
+    ivec3 p2 = p + ivec3(0, 0, u_n);
+    float I = float(imageLoad(lvU, p).r) / LV_FIX, IH = float(imageLoad(lvU, p2).r) / LV_FIX;
+    imageStore(lvU, p, uvec4(0u));
+    imageStore(lvU, p2, uvec4(0u));
+    imageStore(lvOut, p, vec4(I, IH, 0.0, 0.0));
+}
+#endif
+#ifdef K_LBLUR
+layout(local_size_x = 8, local_size_y = 8, local_size_z = 8) in;
+layout(rg16f, binding = 0) uniform writeonly image3D lbOut;
+uniform sampler3D u_lbSrc;
+uniform ivec3 u_lbAxis;
+uniform float u_lbSig;
+uniform int u_lbRad;
+void main() {
+    ivec3 p = cellId();
+    if (outside(p)) return;
+    vec2 acc = vec2(0.0);
+    float ws = 0.0;
+    for (int k = -u_lbRad; k <= u_lbRad; k++) {
+        float w = exp(-float(k * k) / (2.0 * u_lbSig * u_lbSig));
+        ws += w;
+        ivec3 q = p + u_lbAxis * k;
+        if (outside(q)) continue;
+        acc += w * texelFetch(u_lbSrc, q, 0).xy;
+    }
+    imageStore(lbOut, p, vec4(acc / ws, 0.0, 0.0));
+}
+#endif

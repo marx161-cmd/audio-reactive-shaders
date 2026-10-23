@@ -1,0 +1,9 @@
+{
+  "canvas": [1280, 2856],
+  "buffers": [],
+  "wiring": {},
+  "compute": {
+    "script": "sim.py"
+  },
+  "fps": 30
+}

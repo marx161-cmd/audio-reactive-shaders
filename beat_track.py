@@ -81,6 +81,26 @@ PHASE_COMB_DECAY = 0.85
 CONF_GATE = 0.15
 CONF_TAU_S = 0.4
 
+# Bar lock (2026-10-14). When a recognised song's analysed downbeats are known,
+# the phase PLL's error is measured at the BAR scale instead of one beat: the
+# count may sit 1..3 whole beats off the musical "1", which a modulo-one error
+# cannot see, so any shader phrasing on count/N (N a multiple of bpb) lands off
+# the phrase. Wrapping the reference/count difference to the nearest bar makes
+# the SAME rate-only PLL walk the integer offset out -- up to bpb/2 beats, over
+# the clamp-limited slew, never as a jump (the no-teleport invariant).
+
+# Look-ahead phase (2026-10-09, scope.md "look-ahead beat tracker"). The
+# renderer holds the analysis back by the speaker delay, so the frames AFTER
+# the drawn one already exist. Phase is then found by the Ellis DP
+# (dp_beat_track below) over LOOKAHEAD_PAST_S + LOOKAHEAD_FUTURE_S of a low-band
+# onset function: a syncopated hit or ghost note that does not fit the grid
+# continuing AFTER it loses to the regular path, instead of dragging the phase
+# the way the causal comb (_measure_phase_error) does. The comb stays as the
+# fallback when no look-ahead is passed or the DP finds too few beats.
+LOOKAHEAD_PAST_S = 2.2
+LOOKAHEAD_FUTURE_S = 0.6     # + up to ~0.22 s band-delay shift must fit the speaker delay (0.92 s now)
+LOOKAHEAD_MIN_BEATS = 3
+
 # Same wrap, and the same reason, as the shader's BEAT_WRAP: keeping the
 # accumulated count bounded protects float precision (the h21 lesson), and
 # every consumer period in common.glsl divides 1024.
@@ -141,14 +161,25 @@ class BeatTracker:
         # a recalled map slews the clock into alignment over ~a second instead
         # of snapping it and teleporting every body on screen.
         self._ref = None
+        self._ref_count = None               # reference beat index, for bar lock
+        self._bpb = 0                        # beats per bar (0 = unknown/off)
+        self._bar_len = 4                    # bar length for u_beat_bar_phase; keeps the
+                                             # last locked bpb through unlocked bars so
+                                             # bar phase never jumps on lock/unlock
+        self._la = None                      # (odf, current_index, rate_hz) look-ahead window
+        self.phase_source = "comb"
 
     # -- feed ---------------------------------------------------------------
 
-    def update(self, drums_row, audio_t, mono_t):
+    def update(self, drums_row, audio_t, mono_t, lookahead=None):
         """`drums_row` is the stem split's drums output (norm_db, n_bands).
         `audio_t` is the timestamp of the delay-aligned row it came from, used
         only to measure the feed rate; `mono_t` is wall clock, used to advance
-        the count. Returns the uniform dict to publish."""
+        the count. `lookahead` = (odf, current_index, rate_hz): an onset
+        function over past AND future frames around the drawn one, for the DP
+        phase (see LOOKAHEAD_*). Returns the uniform dict to publish."""
+        if lookahead is not None:
+            self._la = lookahead
         row = np.asarray(drums_row, dtype=np.float64)
 
         # Wall-clock delta drives the accumulator. Clamped so a render stall or
@@ -177,7 +208,14 @@ class BeatTracker:
             ref_phase, ref_tbeat = self._ref
             self._tbeat_target = float(np.clip(ref_tbeat,
                                                60.0 / BPM_MAX, 60.0 / BPM_MIN))
-            self._phase_err = _wrap_signed(ref_phase - (self._count % 1.0))
+            # Bar lock: wrap the reference/count beat difference to the nearest
+            # bar so the PLL also removes a whole-beat offset, not just the
+            # fractional part. Falls back to the one-beat error with no bpb.
+            if self._ref_count is not None and self._bpb > 1:
+                diff = self._ref_count - self._count
+                self._phase_err = diff - self._bpb * round(diff / self._bpb)
+            else:
+                self._phase_err = _wrap_signed(ref_phase - (self._count % 1.0))
             self._conf = 1.0
             self._since_estimate = 0.0
         else:
@@ -199,14 +237,25 @@ class BeatTracker:
 
         return self.uniforms()
 
-    def set_reference(self, phase, tbeat):
+    def set_reference(self, phase, tbeat, count=None, bpb=None):
         """Steer to a known beat grid (phase in [0,1), tbeat in seconds).
-        Call every update while a cached map is in play."""
+        Call every update while a cached map is in play.
+
+        `count` is the reference's continuous beat index at `phase`, and `bpb`
+        the song's beats per bar; together they let the count lock to the bar
+        grid (see BAR_*). Both are optional -- without them only the beat phase
+        is steered, as before."""
         self._ref = (float(phase) % 1.0, float(tbeat))
+        self._ref_count = None if count is None else float(count)
+        self._bpb = int(bpb) if bpb and bpb > 1 else 0
+        if self._bpb:
+            self._bar_len = self._bpb
 
     def clear_reference(self):
         """Back to tracking the audio live."""
         self._ref = None
+        self._ref_count = None
+        self._bpb = 0
 
     @property
     def last_odf(self):
@@ -214,12 +263,17 @@ class BeatTracker:
         return float(self._odf[-1])
 
     def uniforms(self):
+        # Bar phase: 0 on the "1" once locked to a song's analysed downbeats
+        # (else count/4, an arbitrary origin). Continuous, so safe to drive
+        # motion; unlike u_ms_bar_phase it is defined even with no analysis.
+        bpb = float(self._bar_len)
         return {
             "u_tbeat": float(self._tbeat),
             "u_beat_phase": float(self._count % 1.0),
             "u_beat_count": float(self._count),
             "u_beat_conf": float(self._conf),
             "u_beat_bpm": float(60.0 / max(self._tbeat, 1e-3)),
+            "u_beat_bar_phase": float((self._count % bpb) / bpb),
         }
 
     # -- internals ----------------------------------------------------------
@@ -347,9 +401,34 @@ class BeatTracker:
         self._conf += (target_conf - self._conf) * conf_k
 
         if self._conf > CONF_GATE:
-            self._phase_err = self._measure_phase_error(x, lock_lag)
+            err = self._measure_dp_phase(lock_lag)
+            if err is None:
+                err = self._measure_phase_error(x, lock_lag)
+                self.phase_source = "comb"
+            else:
+                self.phase_source = "dp"
+            self._phase_err = err
         else:
             self._phase_err = 0.0
+
+    def _measure_dp_phase(self, lag):
+        """Phase from the Ellis DP over the look-ahead window: the optimal
+        beat sequence for the past AND the next LOOKAHEAD_FUTURE_S, then how
+        far the drawn frame sits past its last beat. None = no usable window."""
+        if self._la is None:
+            return None
+        odf, cur, rate = self._la
+        if len(odf) < 8 or cur < 2:
+            return None
+        period = lag / self._rate_hz * rate          # history lag (feed rate) -> window frames
+        if period < 2.0:
+            return None
+        beats = dp_beat_track(odf, period)
+        past = beats[beats <= cur]
+        if len(beats) < LOOKAHEAD_MIN_BEATS or len(past) == 0:
+            return None
+        measured_phase = ((cur - past[-1]) / period) % 1.0
+        return _wrap_signed(measured_phase - (self._count % 1.0))
 
     def _measure_phase_error(self, x, lag):
         """Correlate the onset history against an impulse comb at the locked
@@ -471,7 +550,13 @@ def dp_beat_track(odf, period):
     w_lo = max(1, int(round(period * 0.5)))
     w_hi = max(w_lo + 1, int(round(period * 2.0)))
     gaps = np.arange(w_lo, w_hi + 1, dtype=np.float64)
-    penalty = -DP_TIGHTNESS * (np.log(gaps / period) ** 2)
+    # The penalty for predecessor p is by GAP (i - p) descending as p rises, so
+    # storing it reversed lets each step read a contiguous tail slice instead
+    # of rebuilding `penalty[(i - arange(lo, hi+1)) - w_lo]` (an np.arange
+    # allocation plus a gather) on every one of the n iterations. Bit-exact
+    # against the old form; ~1.7x faster on an 18k-sample track.
+    rev_pen = (-DP_TIGHTNESS * (np.log(gaps / period) ** 2))[::-1]
+    L = w_hi - w_lo + 1
 
     C = np.zeros(n)
     P = np.full(n, -1, dtype=np.int64)
@@ -480,9 +565,8 @@ def dp_beat_track(odf, period):
         if hi < 0:
             C[i] = o[i]
             continue
-        lo = max(i - w_hi, 0)
-        pen = penalty[(i - np.arange(lo, hi + 1)) - w_lo]
-        score = C[lo:hi + 1] + DP_ALPHA * pen
+        lo = i - w_hi if i >= w_hi else 0
+        score = C[lo:hi + 1] + DP_ALPHA * rev_pen[L - (hi - lo + 1):]
         k = int(np.argmax(score))
         C[i] = o[i] + score[k]
         P[i] = lo + k
@@ -645,6 +729,34 @@ def _selftest():
     ok &= good
     print(f"  {'ok ' if good else 'FAIL'} tempo change continuity-> "
           f"max step {max_jump:.4f} beats (limit {limit:.4f})")
+
+    # Bar lock: a whole-beat offset from the reference (the one-beat phase PLL
+    # cannot touch it) must be SLEWED off -- count converges to ref mod bpb --
+    # without the count ever jumping.
+    tr = BeatTracker()
+    for row, t in _synth(120.0, 8.0):
+        tr.update(row, t, t)
+    ref_bpb, ref_rate = 4, 2.0
+    t0, ref0 = 8.0, 1.7                     # deliberately not bar-aligned
+    prev, max_jump, u = None, 0.0, None
+    for i in range(int(14.0 * NOMINAL_RATE_HZ)):
+        mono = t0 + i / NOMINAL_RATE_HZ
+        rc = ref0 + (mono - t0) * ref_rate
+        tr.set_reference(rc % 1.0, 1.0 / ref_rate, count=rc, bpb=ref_bpb)
+        u = tr.update(np.full(120, 0.05), mono, mono)
+        c = u["u_beat_count"]
+        if prev is not None:
+            max_jump = max(max_jump, (c - prev) % BEAT_WRAP)
+        prev = c
+    diff = u["u_beat_count"] - rc
+    e = diff - ref_bpb * round(diff / ref_bpb)
+    limit = (1.0 / NOMINAL_RATE_HZ) * (BPM_MAX / 60.0) * (1.0 + PLL_RATE_CLAMP)
+    good = (abs(e) < 0.15 and max_jump <= limit
+            and abs(u["u_beat_bar_phase"] - (rc % ref_bpb) / ref_bpb) < 0.05)
+    ok &= good
+    print(f"  {'ok ' if good else 'FAIL'} bar lock (offset {ref0}) -> "
+          f"residue {e:+.3f} beats, bar_phase {u['u_beat_bar_phase']:.3f}, "
+          f"max step {max_jump:.4f} (limit {limit:.4f})")
 
     print("PASS" if ok else "FAIL")
     return 0 if ok else 1

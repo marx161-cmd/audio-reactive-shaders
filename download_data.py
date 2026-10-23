@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Download the shaders' data into textures/ (~16 GB for everything).
+"""Download the shaders' data into textures/ (and phone/backdrops/), ~16 GB for everything.
 
 Hosted as a Hugging Face dataset. Standard library only; resumes partial
 downloads and checks every file's SHA-256. Pick what you need:
@@ -8,10 +8,13 @@ downloads and checks every file's SHA-256. Pick what you need:
     python3 download_data.py kerr             # Kerr-Black-Hole-Visualizer, ~6.6 GB
     python3 download_data.py nebulabrot       # Nebulabrot-Infinite-Dive, ~9.1 GB
     python3 download_data.py diamonds         # both stained-glass diamonds, ~44 MB
+    python3 download_data.py embers           # Ember-Flock-Metal-Pit, ~130 MB
+    python3 download_data.py tunnel           # Disnub-Diamond-Checker-Tunnel, ~18 MB
+    python3 download_data.py phone            # wall images for the phone wallpapers, ~18 MB
     python3 download_data.py --check [...]    # only verify what's already there
 
-The Tonnetz-Hex-Lattice shader needs no data. What the files are (see README
-"Rebuilding the data"):
+Tonnetz-Hex-Lattice, Tonnetz-Hex-Pins and both Lagoon-Worms need no data. What
+the files are (see README "Rebuilding the data"):
   textures/kerr_v7/kn/paths32.npy     light paths around the Kerr-Newman hole,
                                       32 layers of 2410x2410 (kn_bake_modal.py)
   textures/kerr_v7/kn/sky.npy         where each pixel's light ends up on the sky
@@ -22,7 +25,9 @@ The Tonnetz-Hex-Lattice shader needs no data. What the files are (see README
   textures/pulsar_orrery/*.npy        star / planet / ring surface maps
                                       (pulsar_orrery_prep.py)
   textures/nebulabrot/*.npy           Buddhabrot density bakes (nebula_bake_modal.py)
-  textures/illusion_diamond/backdrops/*     stained-glass window + its pane data
+  textures/illusion_diamond/backdrops/*     stained-glass windows + their pane data,
+                                      the checker tunnel
+  phone/backdrops/*.png               wall images for the phone wallpapers
 """
 import argparse
 import hashlib
@@ -34,8 +39,9 @@ REPO = "marx161-cmd/audio-reactive-shaders-data"
 BASE = f"https://huggingface.co/datasets/{REPO}/resolve/main/"
 ROOT = os.path.dirname(os.path.abspath(__file__))
 
-# size, sha256, path (relative to the repo root and to the dataset root)
-FILES = [   # group, size, sha256, path
+# groups (space-separated: a file shared by several shaders is in each group), size, sha256,
+# path (relative to the repo root and to the dataset root)
+FILES = [
     ("kerr", 2973747328, "e852551dd73285218e51e2517535ca4938387a3292f79461e59965ab2302fc59", "textures/kerr_v7/kn/paths32.npy"),
     ("kerr", 371718528, "68da545889f63b11111b8527daa004ea766ec30dc023fdb1d4aee75872c54d61", "textures/kerr_v7/kn/sky.npy"),
     ("kerr", 16512, "aa0e1a6ae8d8cf350c470ec6eaf110fc5928d89435334a0c5d288f422fa083f5", "textures/kerr_v7/kn_disk_table_r2_20.npy"),
@@ -55,8 +61,24 @@ FILES = [   # group, size, sha256, path
     ("diamonds", 19396705, "a2ba4304f3f399248b79c2be59238dd0d475a9358f53857b2558339c214024a4", "textures/illusion_diamond/backdrops/azathoth_glass.png"),
     ("diamonds", 15871139, "a5ff613922ae56ad793159cd0c30ecba71246a2b23d7aeba8644230d1c7bcff0", "textures/illusion_diamond/backdrops/azathoth_glass_data.png"),
     ("diamonds", 9155654, "61fc3a3e44090d770ba3bedc81870d7182d6feabf9f8fae5798e9d89c56975c3", "textures/illusion_diamond/backdrops/Picsart_26-10-04_19-14-14-181.png"),
+    ("embers", 22034017, "010ba3ac9c7594ff32944e7b2351149b6854b88b4446f0a5b609bf08c989741f", "textures/illusion_diamond/backdrops/sg_78149_glass.png"),
+    ("embers", 20990411, "41229d11c376bbee5d0acaae6b71b852b23b9c46a9ddbed12ffd249771118679", "textures/illusion_diamond/backdrops/sg_78149_glass_data.png"),
+    ("embers", 20066143, "8caa18fc7af424dd9f6fb2028432f0ab9eda2fa4e6ae5fd9ded8809f73c487b6", "textures/illusion_diamond/backdrops/sg_78150_glass.png"),
+    ("embers", 22786177, "249bd9ecdaa148f9eeda19d57818ac47ce7b73fe6da8533e600c35f3bc06be36", "textures/illusion_diamond/backdrops/sg_78150_glass_data.png"),
+    ("embers", 22087115, "cdff1c7ac530924af2e12552d2c92e5dacc9f91a9cd3a718d2eec85c61106ee0", "textures/illusion_diamond/backdrops/sg_78151_glass.png"),
+    ("embers", 21706972, "1a1f7e9a39f0d50938cc62a72e32af54571a6ca66ad73aaf7bef5cae684e2d73", "textures/illusion_diamond/backdrops/sg_78151_glass_data.png"),
+    ("tunnel", 18282545, "9dc21b4074536cab455d96f8994d6000ca2594cc3c8cf0b28ac384c51b760e60", "textures/illusion_diamond/backdrops/tunnel_cc.png"),
+    ("phone", 3147687, "51e9d6d6f43f011302545b20e1b25f5497395036e842233ee0ad8c88dabc2b2d", "phone/backdrops/dio_backC.png"),
+    ("phone", 1970166, "a18695736f56ee8d4da52b069c758304c7864bc9ee19656bb1de436f93e82204", "phone/backdrops/dio_botC.png"),
+    ("phone", 1013644, "502d525cd73ba7611207f3c4fdbb9a1f96197b199d7948e06ed5da118049d965", "phone/backdrops/dio_botS.png"),
+    ("phone", 2125875, "7021afd4df1b1dec918b50cd6c8112a7fe9ea799e04791c464f76dfa2a700b5b", "phone/backdrops/dio_topC.png"),
+    ("phone", 1044656, "0f39953834ec3897342d2912eedfab9e1b05c04977dff6544a4a2e817b16a5ee", "phone/backdrops/dio_topS.png"),
+    ("phone", 3530958, "6e92c751dd129a9a28e00d73e368031948c5518604bdd6b4fa176f785e8a1e28", "phone/backdrops/dio_wlC.png"),
+    ("phone", 979830, "f2b27e3b545639f3224081d20ca570e3fc7614fe8fa8a397c6860b2e8bb00034", "phone/backdrops/dio_wlS.png"),
+    ("phone", 3491918, "909d45d77d3b0288f8b08f228e3e1d1bcb5ce68ea0dbcaf807a1c9ab58c15781", "phone/backdrops/dio_wrC.png"),
+    ("phone", 932987, "71bcf132e6e450dcaa977c1bca32d866e9362e93b1cb247b6df48e887da51c0c", "phone/backdrops/dio_wrS.png"),
 ]
-GROUPS = sorted({g for g, *_ in FILES})
+GROUPS = sorted({g for gs, *_ in FILES for g in gs.split()})
 
 
 def sha256(path):
@@ -94,7 +116,7 @@ def main():
     want = set(args.groups) or set(GROUPS)
     bad = 0
     for group, size, digest, rel in FILES:
-        if group not in want:
+        if not want & set(group.split()):
             continue
         path = os.path.join(ROOT, rel)
         ok = os.path.isfile(path) and os.path.getsize(path) == size and sha256(path) == digest

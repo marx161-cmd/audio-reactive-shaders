@@ -80,10 +80,20 @@ def kerr_pt_closed(r, a_star):
 
 
 if __name__ == "__main__":
+    import argparse
     import os
+    # 2026-10-01: --rin/--rout/--out for a truncated disk (v11: 2-20 Rs, scope.md
+    # 2026-10-01). Page-Thorne zero torque then sits at rin, so F peaks just
+    # outside it and F/Fmax is normalised over the disk actually shown.
+    # Defaults = the original table (ISCO .. 7.27 Rs, kn_disk_table.npy).
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--rin", type=float, default=None, help="inner edge, Rs (default: the KN ISCO)")
+    ap.add_argument("--rout", type=float, default=None, help="outer edge, Rs (default: 7.27)")
+    ap.add_argument("--out", default="textures/kerr_v7/kn_disk_table.npy")
+    args = ap.parse_args()
     a_star, Q_star = 0.997, 0.07
     a, Q = a_star * M, Q_star * M
-    r_out = float(np.sqrt((0.35 / 0.048) ** 2 - a * a))
+    r_out = args.rout if args.rout else float(np.sqrt((0.35 / 0.048) ** 2 - a * a))
     # --- validation at Q = 0 against the closed form
     r0 = isco(a, 0.0)
     rr = np.geomspace(r0 * 1.001, r_out, 400)
@@ -92,13 +102,16 @@ if __name__ == "__main__":
     print(f"Q=0: ISCO {r0:.6f} Rs (closed form 0.638891); flux shape max |diff| {np.abs(Fn - Fc).max():.2e}")
     # --- Kerr-Newman table
     ri = isco(a, Q)
+    if args.rin is not None:
+        assert args.rin >= ri, f"--rin {args.rin} is inside the ISCO {ri:.4f}: no circular orbits there"
+        ri = args.rin
     rr = np.geomspace(ri, r_out, 1024)
     Om, ut, E, L = circ(rr, a, Q)
     F = flux(rr, a, Q, ri); F[0] = 0.0
     Fmax = F.max(); rpk = rr[np.argmax(F)]
-    print(f"Q*={Q_star}: ISCO {ri:.6f} Rs, flux peak at r = {rpk:.4f} Rs, orbital period there "
+    print(f"Q*={Q_star}: inner edge {ri:.6f} Rs, flux peak at r = {rpk:.4f} Rs, orbital period there "
           f"{2 * np.pi / np.interp(rpk, rr, Om):.4f} Rs/c")
     tab = np.stack([Om, ut, F / Fmax, rr], -1).astype(np.float32)[None]
-    out = os.path.join(os.path.dirname(os.path.abspath(__file__)), "textures/kerr_v7/kn_disk_table.npy")
+    out = os.path.join(os.path.dirname(os.path.abspath(__file__)), args.out)
     np.save(out, tab)
     print("wrote", out, tab.shape)

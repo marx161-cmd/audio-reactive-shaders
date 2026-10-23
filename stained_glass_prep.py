@@ -10,7 +10,7 @@ Outputs into dir:
   lead_normal.png  tangent normal map of lead relief
   preview.png      lead (red) over original, downscaled for eyeballing
 """
-import sys, numpy as np
+import os, sys, numpy as np
 from PIL import Image
 from scipy import ndimage as ndi
 
@@ -21,8 +21,15 @@ og = np.asarray(Image.open(f'{d}/source_original.png').convert('RGB')).astype(np
 # --- lead: dark AND (nearly) unsaturated, on the contrast-boosted copy
 mx, mn = hc.max(2), hc.min(2)
 sat = (mx - mn) / (mx + 1e-6)
-LEAD_V, LEAD_S = 24, 0.5
+# thresholds overridable for DARK glass (2026-10-16: the Snapseed charcoal windows have panes at 8..32, so the
+# defaults swallowed them as lead): SG_LEAD_V / SG_DARKISH / SG_GROW, defaults unchanged
+LEAD_V, LEAD_S = float(os.environ.get('SG_LEAD_V', 24)), 0.5
 lead = (mx < LEAD_V) & (sat < LEAD_S)
+# SG_THIN_R (optional, 2026-10-16, black-and-gold marble glass: its black panes are as black as the lead): keep only THIN
+# dark lines as lead -- a dark region thicker than ~2*SG_THIN_R px survives an opening with that square and is a PANE.
+_thin = int(os.environ.get('SG_THIN_R', 0))
+if _thin > 0:
+    lead &= ~ndi.binary_opening(lead, structure=np.ones((2 * _thin + 1, 2 * _thin + 1)))
 lead = ndi.binary_closing(lead, structure=np.ones((3, 3)), iterations=2)   # bridge breaks in came
 # drop lead specks (dark-glass noise) that aren't part of a connected line network
 ll, ln_ = ndi.label(lead)
@@ -32,8 +39,8 @@ lead = keepl[ll]
 lead = ndi.binary_dilation(lead, structure=np.ones((3, 3)), iterations=1)   # cover dark fringe at came edges
 
 # grow into adjacent dark pixels the saturation test rejected (bluish edge of thick came)
-darkish = mx < 55
-lead = ndi.binary_dilation(lead, structure=np.ones((3, 3)), iterations=6, mask=darkish | lead)
+darkish = mx < float(os.environ.get('SG_DARKISH', 55))
+lead = ndi.binary_dilation(lead, structure=np.ones((3, 3)), iterations=int(os.environ.get('SG_GROW', 6)), mask=darkish | lead)
 
 # --- panes = connected components of non-lead
 glass = ~lead

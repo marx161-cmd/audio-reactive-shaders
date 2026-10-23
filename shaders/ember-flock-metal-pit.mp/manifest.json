@@ -1,0 +1,28 @@
+{
+  "canvas": [
+    1280,
+    2856
+  ],
+  "buffers": [],
+  "wiring": {},
+  "compute": {
+    "script": "sim.py"
+  },
+  "fps": 60,
+  "static_textures": {
+    "u_wallC": "textures/illusion_diamond/backdrops/sg_78150_glass.png",
+    "u_wallD": "textures/illusion_diamond/backdrops/sg_78150_glass_data.png",
+    "u_flrC": "textures/illusion_diamond/backdrops/sg_78149_glass.png",
+    "u_flrD": "textures/illusion_diamond/backdrops/sg_78149_glass_data.png",
+    "u_backC": "textures/illusion_diamond/backdrops/sg_78151_glass.png",
+    "u_backD": "textures/illusion_diamond/backdrops/sg_78151_glass_data.png"
+  },
+  "static_texture_filters": {
+    "u_wallC": "linear_mip",
+    "u_wallD": "linear_mip",
+    "u_flrC": "linear_mip",
+    "u_flrD": "linear_mip",
+    "u_backC": "linear_mip",
+    "u_backD": "linear_mip"
+  }
+}

@@ -1,0 +1,160 @@
+{
+ "images": [
+  {
+   "name": "boid",
+   "format": "rgba32f",
+   "size": "4608x3",
+   "swap": true
+  },
+  {
+   "name": "ctl",
+   "format": "r32f",
+   "size": "208x1",
+   "swap": false
+  },
+  {
+   "name": "flk",
+   "format": "r32f",
+   "size": "64x1",
+   "swap": false
+  },
+  {
+   "name": "ldr",
+   "format": "r32f",
+   "size": "768x72",
+   "swap": false
+  },
+  {
+   "name": "spk",
+   "format": "r32f",
+   "size": "8192x8",
+   "swap": false
+  },
+  {
+   "name": "glowI",
+   "format": "r32ui",
+   "size": "640x1428",
+   "swap": false
+  },
+  {
+   "name": "glowH",
+   "format": "r32ui",
+   "size": "640x1428",
+   "swap": false
+  },
+  {
+   "name": "rad",
+   "format": "rgba16f",
+   "size": "640x1428",
+   "swap": false
+  },
+  {
+   "name": "blmA",
+   "format": "rgba16f",
+   "size": "320x714",
+   "swap": false
+  },
+  {
+   "name": "blmT",
+   "format": "rgba16f",
+   "size": "320x714",
+   "swap": false
+  },
+  {
+   "name": "blmB",
+   "format": "rgba16f",
+   "size": "160x357",
+   "swap": false
+  },
+  {
+   "name": "blmU",
+   "format": "rgba16f",
+   "size": "160x357",
+   "swap": false
+  }
+ ],
+ "sections": [
+  {
+   "name": "init",
+   "repeat": 1,
+   "rate": 1,
+   "local": [
+    64,
+    1,
+    1
+   ],
+   "writes_out": [],
+   "threads": [
+    4608,
+    1,
+    1
+   ]
+  },
+  {
+   "name": "reduce",
+   "repeat": 1,
+   "rate": 1,
+   "local": [
+    256,
+    1,
+    1
+   ],
+   "writes_out": [],
+   "threads": [
+    512,
+    1,
+    1
+   ]
+  },
+  {
+   "name": "ctrl",
+   "repeat": 1,
+   "rate": 1,
+   "local": [
+    1,
+    1,
+    1
+   ],
+   "writes_out": [],
+   "threads": [
+    1,
+    1,
+    1
+   ]
+  },
+  {
+   "name": "form",
+   "repeat": 1,
+   "rate": 1,
+   "local": [
+    256,
+    1,
+    1
+   ],
+   "writes_out": [],
+   "threads": [
+    512,
+    1,
+    1
+   ]
+  },
+  {
+   "name": "boids",
+   "repeat": 1,
+   "rate": 1,
+   "local": [
+    64,
+    1,
+    1
+   ],
+   "writes_out": [
+    "boid"
+   ],
+   "threads": [
+    4608,
+    1,
+    1
+   ]
+  }
+ ]
+}

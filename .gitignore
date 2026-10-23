@@ -16,3 +16,7 @@ cam_target.txt
 autodive.txt
 autozoom.txt
 gyro_state.txt
+pad.json
+gamepad.json
+director/plans/
+director/cache/

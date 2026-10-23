@@ -1,0 +1,1256 @@
+uniform int   u_n;
+uniform float u_H;
+uniform float u_dt;
+#define PULSE_SLOT0 8
+#define PULSE_N     8
+#define PULSE_V     2.5
+#define PULSE_W     0.08
+#define PULSE_LIFE  1.2
+#define PULSE_GAIN  0.0
+
+ivec3 cellId() { return ivec3(gl_GlobalInvocationID); }
+bool outside(ivec3 p) { return any(lessThan(p, ivec3(0))) || any(greaterThanEqual(p, ivec3(u_n))); }
+float cellH() { return 2.0 * u_H / float(u_n); }
+vec3 cellPos(ivec3 p) { return ((vec3(p) + 0.5) / float(u_n) * 2.0 - 1.0) * u_H; }
+vec3 toUVW(vec3 x) { return x / (2.0 * u_H) + 0.5; }
+
+const ivec3 NB[6] = ivec3[6](ivec3(1, 0, 0), ivec3(-1, 0, 0), ivec3(0, 1, 0),
+                             ivec3(0, -1, 0), ivec3(0, 0, 1), ivec3(0, 0, -1));
+
+#define EPS        1e-3
+uniform float u_eps;
+
+#define VEL_TAU    4.0
+#define VISC_A     0.35
+#define STIR_R     0.08
+#define STIR_RATE  10.0
+
+#if defined(K_MASK) || defined(K_ADV_FWD) || defined(K_ADV_CORR) || defined(K_FORCE) || defined(K_DIV) \
+ || defined(K_SMOOTH) || defined(K_MARK) || defined(K_RESTRICT) || defined(K_PROLONG) || defined(K_PROJECT)
+layout(local_size_x = 8, local_size_y = 8, local_size_z = 8) in;
+#endif
+
+#ifdef K_MASK
+layout(rgba16f, binding = 0) uniform writeonly image3D wallImg;
+layout(r16f,    binding = 1) uniform writeonly image3D maskImg;
+layout(rgba16f, binding = 2) uniform image3D velImg;
+void main() {
+    ivec3 p = cellId();
+    if (outside(p)) return;
+    bool fluid = all(greaterThan(p, ivec3(0))) && all(lessThan(p, ivec3(u_n - 1)));
+    imageStore(wallImg, p, vec4(0.0, 0.0, 0.0, fluid ? 1.0 : 0.0));
+    imageStore(maskImg, p, vec4(fluid ? 1.0 : 0.0));
+    if (!fluid) imageStore(velImg, p, vec4(0.0));
+}
+#endif
+
+#ifdef K_FORCE
+layout(rgba16f, binding = 0) uniform image3D velImg;
+uniform sampler2D u_worm;
+void main() {
+    ivec3 p = cellId();
+    if (outside(p)) return;
+    vec4 v = imageLoad(velImg, p);
+    if (v.w < 0.5) return;
+    vec3 x = cellPos(p);
+    for (int k = 0; k < 2; k++) {
+        vec3 a = texelFetch(u_worm, ivec2(2 + k, 0), 0).xyz;
+        vec3 b = texelFetch(u_worm, ivec2(k, 0), 0).xyz;
+        vec3 ab = b - a;
+        float h = clamp(dot(x - a, ab) / max(dot(ab, ab), 1e-12), 0.0, 1.0);
+        float d = length(x - a - ab * h);
+        float g = exp(-(d / STIR_R) * (d / STIR_R));
+        vec3 wv = ab / max(u_dt, 1e-4);
+        v.xyz += (wv - v.xyz) * (1.0 - exp(-u_dt * STIR_RATE * g));
+    }
+    v.xyz *= exp(-u_dt / VEL_TAU);
+    imageStore(velImg, p, v);
+}
+#endif
+#ifdef K_ADV_FWD
+layout(rgba16f, binding = 0) uniform writeonly image3D outImg;
+uniform sampler3D u_src;
+uniform sampler3D u_vel;
+
+void main() {
+    ivec3 p = cellId();
+    if (outside(p)) return;
+    vec3 x = cellPos(p);
+    vec3 u = texelFetch(u_vel, p, 0).xyz;
+    imageStore(outImg, p, texture(u_src, toUVW(x - u_dt * u)));
+}
+#endif
+
+#ifdef K_ADV_CORR
+layout(rgba16f, binding = 0) uniform writeonly image3D outImg;
+layout(r16f,    binding = 1) uniform readonly image3D maskImg;
+uniform sampler3D u_src;
+uniform sampler3D u_fwd;
+uniform sampler3D u_vel;
+
+void main() {
+    ivec3 p = cellId();
+    if (outside(p)) return;
+    vec3 x = cellPos(p);
+    vec3 u = texelFetch(u_vel, p, 0).xyz;
+    vec4 fh = texelFetch(u_fwd, p, 0);
+    vec4 back = texture(u_fwd, toUVW(x + u_dt * u));
+    vec4 res = fh + 0.5 * (texelFetch(u_src, p, 0) - back);
+
+    vec3 g = toUVW(x - u_dt * u) * float(u_n) - 0.5;
+    ivec3 b0 = ivec3(floor(g));
+    vec4 lo = vec4(1e9), hi = vec4(-1e9);
+    for (int k = 0; k < 8; k++) {
+        ivec3 c = clamp(b0 + ivec3(k & 1, (k >> 1) & 1, k >> 2), ivec3(0), ivec3(u_n - 1));
+        vec4 v = texelFetch(u_src, c, 0);
+        lo = min(lo, v);
+        hi = max(hi, v);
+    }
+    res = clamp(res, lo, hi);
+    res.a = imageLoad(maskImg, p).r;
+    imageStore(outImg, p, res);
+}
+#endif
+
+#ifdef K_SMOOTH
+layout(r32f, binding = 0) uniform image3D qImg;
+layout(r32f, binding = 1) uniform readonly image3D bImg;
+layout(r16f, binding = 2) uniform readonly image3D mImg;
+uniform int u_parity;
+uniform int u_wallOnly;
+
+void main() {
+    ivec3 p = cellId();
+    if (outside(p)) return;
+    if (((p.x + p.y + p.z) & 1) != u_parity) return;
+    float mp = imageLoad(mImg, p).r;
+    if (mp < 0.5) return;
+    if (u_wallOnly == 1 && mp < 1.25) return;
+    float s = 0.0, cnt = 0.0;
+    for (int k = 0; k < 6; k++) {
+        ivec3 q = p + NB[k];
+        if (outside(q) || imageLoad(mImg, q).r < 0.5) continue;
+        s += imageLoad(qImg, q).r;
+        cnt += 1.0;
+    }
+    imageStore(qImg, p, vec4((s - imageLoad(bImg, p).r) / (cnt + u_eps)));
+}
+#endif
+
+#ifdef K_MARK
+layout(r16f, binding = 0) uniform image3D mImg;
+
+void main() {
+    ivec3 p = cellId();
+    if (outside(p)) return;
+    if (imageLoad(mImg, p).r < 0.5) return;
+    for (int k = 0; k < 6; k++) {
+        ivec3 q = p + NB[k];
+        if (outside(q) || imageLoad(mImg, q).r < 0.5) { imageStore(mImg, p, vec4(1.5)); return; }
+    }
+}
+#endif
+
+#ifdef K_RESTRICT
+layout(r32f, binding = 0) uniform readonly image3D qfImg;
+layout(r32f, binding = 1) uniform readonly image3D bfImg;
+layout(r16f, binding = 2) uniform readonly image3D mfImg;
+layout(r32f, binding = 3) uniform writeonly image3D qcImg;
+layout(r32f, binding = 4) uniform writeonly image3D bcImg;
+layout(r16f, binding = 5) uniform writeonly image3D mcImg;
+
+void main() {
+    ivec3 c = cellId();
+    if (outside(c)) return;
+    int nf = 2 * u_n;
+    float sumR = 0.0, sumM = 0.0;
+    for (int k = 0; k < 8; k++) {
+        ivec3 f = 2 * c + ivec3(k & 1, (k >> 1) & 1, k >> 2);
+        float m = imageLoad(mfImg, f).r;
+        sumM += min(m, 1.0);
+        if (m < 0.5) continue;
+        float qi = imageLoad(qfImg, f).r;
+        float s = 0.0, cnt = 0.0;
+        for (int j = 0; j < 6; j++) {
+            ivec3 q = f + NB[j];
+            if (any(lessThan(q, ivec3(0))) || any(greaterThanEqual(q, ivec3(nf)))) continue;
+            if (imageLoad(mfImg, q).r < 0.5) continue;
+            s += imageLoad(qfImg, q).r;
+            cnt += 1.0;
+        }
+        sumR += imageLoad(bfImg, f).r - (s - (cnt + u_eps) * qi);
+    }
+    imageStore(qcImg, c, vec4(0.0));
+    imageStore(bcImg, c, vec4(0.5 * sumR));
+    imageStore(mcImg, c, vec4(sumM / 8.0));
+}
+#endif
+
+#ifdef K_PROLONG
+layout(r32f, binding = 0) uniform image3D qfImg;
+layout(r16f, binding = 1) uniform readonly image3D mfImg;
+layout(r32f, binding = 2) uniform readonly image3D qcImg;
+layout(r16f, binding = 3) uniform readonly image3D mcImg;
+
+void main() {
+    ivec3 p = cellId();
+    if (outside(p)) return;
+    if (imageLoad(mfImg, p).r < 0.5) return;
+    int nc = u_n / 2;
+    ivec3 c0 = p / 2;
+    ivec3 o = 2 * (p & 1) - 1;
+    float sum = 0.0, wsum = 0.0;
+    for (int k = 0; k < 8; k++) {
+        ivec3 sel = ivec3(k & 1, (k >> 1) & 1, k >> 2);
+        ivec3 c = c0 + sel * o;
+        if (any(lessThan(c, ivec3(0))) || any(greaterThanEqual(c, ivec3(nc)))) continue;
+        if (imageLoad(mcImg, c).r < 0.5) continue;
+        vec3 w3 = mix(vec3(0.75), vec3(0.25), vec3(sel));
+        float w = w3.x * w3.y * w3.z;
+        sum += w * imageLoad(qcImg, c).r;
+        wsum += w;
+    }
+    if (wsum > 0.0) imageStore(qfImg, p, vec4(imageLoad(qfImg, p).r + sum / wsum));
+}
+#endif
+
+#ifdef K_PROJECT
+layout(rgba16f, binding = 0) uniform image3D velImg;
+layout(r32f,    binding = 1) uniform readonly image3D qImg;
+layout(rgba16f, binding = 2) uniform readonly image3D wallImg;
+
+void main() {
+    ivec3 p = cellId();
+    if (outside(p)) return;
+    vec4 w = imageLoad(wallImg, p);
+    if (w.w < 0.5) { imageStore(velImg, p, vec4(w.xyz, 0.0)); return; }
+    float qc = imageLoad(qImg, p).r;
+    float qn[6];
+    for (int k = 0; k < 6; k++) {
+        ivec3 q = p + NB[k];
+        qn[k] = (!outside(q) && imageLoad(wallImg, q).w > 0.5) ? imageLoad(qImg, q).r : qc;
+    }
+    vec4 v = imageLoad(velImg, p);
+    v.xyz -= 0.5 * vec3(qn[0] - qn[1], qn[2] - qn[3], qn[4] - qn[5]);
+    imageStore(velImg, p, v);
+}
+#endif
+
+#ifdef K_DIV
+layout(local_size_x = 8, local_size_y = 8, local_size_z = 8) in;
+layout(r32f,    binding = 0) uniform writeonly image3D bImg;
+layout(rgba16f, binding = 1) uniform readonly image3D velImg;
+layout(rgba16f, binding = 2) uniform readonly image3D wallImg;
+vec3 uAt(ivec3 q) {
+    if (outside(q)) return vec3(0.0);
+    vec4 w = imageLoad(wallImg, q);
+    return w.w > 0.5 ? imageLoad(velImg, q).xyz : w.xyz;
+}
+void main() {
+    ivec3 p = cellId();
+    if (outside(p)) return;
+    if (imageLoad(wallImg, p).w < 0.5) { imageStore(bImg, p, vec4(0.0)); return; }
+    float D = 0.5 * ((uAt(p + NB[0]).x - uAt(p + NB[1]).x)
+                   + (uAt(p + NB[2]).y - uAt(p + NB[3]).y)
+                   + (uAt(p + NB[4]).z - uAt(p + NB[5]).z));
+    imageStore(bImg, p, vec4(D));
+}
+#endif
+
+#ifdef K_VISC
+layout(local_size_x = 8, local_size_y = 8, local_size_z = 8) in;
+layout(rgba16f, binding = 0) uniform writeonly image3D dstImg;
+uniform sampler3D u_src;
+void main() {
+    ivec3 p = cellId();
+    if (outside(p)) return;
+    vec4 c = texelFetch(u_src, p, 0);
+    if (c.w < 0.5) { imageStore(dstImg, p, c); return; }
+    vec3 s = vec3(0.0);
+    float n = 0.0;
+    for (int k = 0; k < 6; k++) {
+        ivec3 q = p + NB[k];
+        if (outside(q)) continue;
+        vec4 o = texelFetch(u_src, q, 0);
+        if (o.w < 0.5) continue;
+        s += o.xyz; n += 1.0;
+    }
+    if (n > 0.0) c.xyz += (s / n - c.xyz) * VISC_A;
+    imageStore(dstImg, p, c);
+}
+#endif
+
+#ifdef K_WORM
+layout(local_size_x = 1) in;
+layout(r32f,    binding = 0) uniform image2D stImg;
+layout(rgba32f, binding = 1) uniform image2D wormImg;
+uniform float iTimeDelta, u_kick, u_beat_count, u_tbeat, u_presence, u_brilliance, u_drum_high, u_beat_bpm;
+uniform float u_ms_source, u_ms_change, u_ms_next_in, u_ms_drop_in, u_ms_repeat;
+uniform vec4 u_ms_cur_a, u_ms_cur_b, u_ms_sec_a, u_ms_sec_b, u_ms_next_a, u_ms_next_b;
+#define ORBIT_BEATS  16.0
+#define F_HI_TAU     0.30
+#define F_SEP_ATT    0.08
+#define F_SEP_REL    0.35
+#define BIN_T        0.1
+#define BIN_SEP0     0.035
+#define BIN_SEP1     0.50
+#define BIN_BOB      0.07
+#define BIN_KICK_SEP 0.22
+#define WORM_SCALE   1.15
+#define WORM_MAX_R   1.25
+#define N_MODES      5.0
+#define SPLIT_E      0.85
+#define SPLIT_I      0.20
+#define SPLIT_EDGE   1.00
+#define SPLIT_INNER  0.20
+#define SPLIT_SWEEP  0.45
+#define SPLIT_WARP   0.40
+#define WELL_G       2.5
+#define PUSH_RATE    0.5
+#define PUSH_EARLY   4.0
+#define KICK_WOBBLE  0.12
+#define POCKET_MAX   0.6
+#define POCKET_TAU   1.0
+#define PIR_R        0.035
+#define PIR_BEATS    2.0
+#define HAT_REL      0.30
+#define WINDUP_BEATS 8.0
+#define WINDUP_K     0.6
+#define SPONGE_NEAR  0.05
+#define SPONGE_FAR   0.25
+#define SPONGE_BEATS 4.0
+#define SPONGE_PUSH  0.30
+#define STRETCH_BEATS 8.0
+#define SEP_NEAR      0.10
+#define SEP_FAR_QUIET 0.70
+#define SEP_FAR_LOUD  0.28
+#define FIG_BEATS      8.0
+#define FIG_MORPH_BEATS 1.0
+vec3 rot2(vec3 v, int ax, float a) {
+    float c = cos(a), s = sin(a);
+    if (ax == 0) v.xy = mat2(c, -s, s, c) * v.xy; else v.yz = mat2(c, -s, s, c) * v.yz;
+    return v;
+}
+vec3 inside(vec3 p) { float r = length(p); return r > WORM_MAX_R ? p * (WORM_MAX_R / r) : p; }
+float circDist(float a, float b) { float d = abs(a - b); return min(d, N_MODES - d); }
+#define FIG_MIRROR_K  0.05
+#define PLANE_ROT  1.5707963
+#define SQUISH_X   0.45
+#define FIG_ROT    0.0
+vec3 headOffAt(float bc, vec4 w, float wE, float pocket, vec3 sepX, float edge, float blade, float camLock, float laneZ, float loud) {
+    float spin = 6.2831853 * bc / ORBIT_BEATS;
+    float t = bc * BIN_T;
+    float wave = 0.5 - 0.5 * cos(6.2831853 * bc / STRETCH_BEATS);
+    float farR = mix(SEP_FAR_LOUD, SEP_FAR_QUIET, 1.0 - loud);
+    float sep = mix(SEP_NEAR, farR, wave) + BIN_KICK_SEP * sepX.x;
+    sep += SPONGE_PUSH * sepX.y;
+    sep *= 1.0 - WINDUP_K * sepX.z;
+    float rose = 1.0 - pocket * (0.5 - 0.5 * cos(spin * 3.0));
+    vec3 offA = vec3(cos(spin) * sep, sin(spin * 1.5) * BIN_BOB, sin(spin) * sep);
+    vec3 offB = vec3(cos(spin) * sep, sin(spin) * BIN_BOB, sin(2.0 * spin) * 0.5 * sep);
+    float rr = sep * (1.0 - 0.6 * (0.5 - 0.5 * cos(3.0 * spin)));
+    vec3 offC = vec3(cos(spin) * rr, sin(3.0 * spin) * 2.0 * BIN_BOB, sin(spin) * rr);
+    float sMid = 0.5 * (SPLIT_EDGE + SPLIT_INNER), sRad = 0.5 * (SPLIT_EDGE - SPLIT_INNER);
+    float sPh = spin + SPLIT_WARP * sin(spin);
+    vec3 offD = vec3(sMid + sRad * cos(sPh), BIN_BOB * sin(spin * 1.5), SPLIT_SWEEP * sin(sPh));
+    vec3 offE = vec3(SPLIT_SWEEP * sin(sPh), BIN_BOB * sin(spin * 1.5), sMid + sRad * cos(sPh));
+    float wsum = max(w.x + w.y + w.z + w.w + wE, 1e-4);
+    vec3 off = (offA * w.x + offB * w.y + offC * w.z) / wsum;
+    off.xz *= rose;
+    off += (offD * w.w + offE * wE) / wsum;
+    vec3 nat = off;
+    float tum = t * 1.2;
+    nat.xy = mat2(cos(tum), -sin(tum), sin(tum), cos(tum)) * nat.xy;
+    float tum2 = tum * 0.8;
+    nat.yz = mat2(cos(tum2), -sin(tum2), sin(tum2), cos(tum2)) * nat.yz;
+    vec2 pl = mat2(cos(PLANE_ROT), -sin(PLANE_ROT), sin(PLANE_ROT), cos(PLANE_ROT)) * vec2(off.x, off.z);
+    vec3 camP = vec3(pl.x, pl.y, off.y);
+    camP.z += laneZ;
+    vec3 n = vec3(cos(blade), sin(blade), 0.0);
+    float ce = cos(edge), se = sin(edge);
+    camP = camP * ce + cross(n, camP) * se + n * dot(n, camP) * (1.0 - ce);
+    vec3 locked = transpose(camRot()) * camP;
+    return mix(nat, locked, clamp(camLock, 0.0, 1.0)) * WORM_SCALE;
+}
+float pickMode(vec4 A, vec4 B) {
+    float calm   = 0.7 * (1.0 - A.x) + 0.3 * (1.0 - A.z);
+    float groove = 0.6 * B.x + 0.2 * (1.0 - abs(A.x - 0.6));
+    float busy   = 0.45 * A.z + 0.25 * B.y + 0.2 * A.w;
+    float heavy  = 0.6 * A.y + 0.5 * max(B.w, 0.0) + 0.2 * A.x;
+    float m = 0.0, best = calm;
+    if (groove > best) { best = groove; m = 1.0; }
+    if (busy   > best) { best = busy;   m = 2.0; }
+    if (heavy  > best) { best = heavy;  m = 3.0; }
+    if (m == 3.0 && A.x >= SPLIT_E && B.w >= SPLIT_I) m = 4.0;
+    return m;
+}
+#define KEPLER_BEATS 16.0
+#define ORBIT_BEATS_FAST 6.0
+#define ORBIT_BEATS_SLOW 10.0
+#define ORBIT_A0  0.50
+#define ORBIT_A1  0.90
+#define ORBIT_E0  0.30
+#define ORBIT_E1  0.55
+#define ORBIT_E_KICK 0.10
+#define ORBIT_E_MAX 0.60
+#define ORBIT_INC0 0.25
+#define ORBIT_INC1 1.10
+#define ORBIT_PREC 0.20
+#define FIG_CYCLE  16.0
+#define FIG_HOLD   8.0
+#define FIG_HANDOFF 1.0
+#define FIG_BREAK_R 0.5
+#define FIG_EDGE0   0.0
+#define FIG_EDGE1   1.5707963
+#define TILT_DEG    0.7853982
+#define FIG_CAMLOCK 2.0
+#define NAT_BEATS   2.0
+#define NAT_CALM    1.0
+#define FIG_LANE_N     4.0
+#define FIG_LANE_Z0    0.175
+#define FIG_LANE_DZ    0.30
+#define FIG_LANE_BEATS 8.0
+#define RUSH_BEATS    0.9
+#define RUSH_SHORT    0.05
+#define GOO_BEATS  6.0
+#define GOO_R      0.035
+#define GOO_W      22.0
+#define GOO_Z      0.06
+#define GOO_ATT    0.3
+#define GOO_REL    2.0
+#define STIR_BEATS 8.0
+#define TORN_W     11.0
+#define TORN_LEAD  3.14159
+#define TORN_R0    0.05
+#define TORN_R1    0.40
+#define TORN_H     0.55
+#define TORN_EXIT_H 2.2
+#define TORN_EXIT_R 1.3
+#define FLICKER_BEATS   1.0
+#define FLICKER_STROBES 4.0
+#define FRZ_ADD_E     15.0
+#define FRZ_ADD_D     15.0
+#define FRZ_BPM_LO   150.0
+#define FRZ_BPM_HI   160.0
+#define FRZ_HOLD_BEATS 32.0
+#define FRZ_ON    0.55
+#define FRZ_OFF   0.30
+#define TURN_W     0.0156
+#define TURN_R_CENTRE 8.0
+#define TURN_R_FAR    4.0
+#define TURN_R_MID   12.0
+#define TURN_AXIS  normalize(vec3(0.6, 0.5, 0.2))
+#define REPEL_A    0.06
+#define REPEL_R0   0.18
+#define REPEL_SWIRL 2.5
+vec3 softCore(vec3 p) {
+    float r = length(p);
+    vec3 dir = r > 1e-4 ? p / r : vec3(1.0, 0.0, 0.0);
+    vec3 tan = normalize(cross(vec3(0.0, 1.0, 0.0), dir));
+    return p + (dir + REPEL_SWIRL * tan) * (REPEL_A * exp(-r / REPEL_R0));
+}
+#define HAT_HIT   0.06
+#define HAT_SPIN  0.7853982
+#define SCATTER_SPD    3.0
+#define HAWK_TAU   0.35
+#define HAWK_KICK  0.25
+#define HAWK_SPD   1.5
+#define HAWK_SPIN  17.95
+#define SWIM_SPLIT   0.03125
+#define HELIX_H      0.62
+#define HELIX_W      0.16
+#define HELIX_CLIMB  0.80
+#define FORM_HELIX_BEATS 5.0
+#define RING_R       0.65
+#define SWIM_SPIRAL_TURNS 3.0
+#define SWIM_SPIRAL_COILS 5.0
+#define PUNCH_D      1.5
+#define PUNCH_SHOT   0.28
+#define SUCK_MIN     0.12
+#define SWIM_WAVE_TURNS   2.5
+#define SWIM_WAVE_COILS   4.0
+#define SWIM_HELIX_TURNS 4.0
+#define SWIM_FACE_TURNS  4.0
+#define SWIM_HELIX_SPIN  0.0625
+#define SWIM_R      0.85
+vec3 swimSlot(int sh, float u, float f, float bc) {
+    float ud = (u - SWIM_SPLIT) / (1.0 - SWIM_SPLIT);
+    if (sh == 1) {
+        if (u < SWIM_SPLIT) {
+            float t  = u / SWIM_SPLIT;
+            float y  = mix(HELIX_H, -HELIX_H, t);
+            float sx = HELIX_W * (f < 0.5 ? -1.0 : 1.0);
+            return vec3(sx, y, 0.0);
+        }
+        float uEnd = HELIX_CLIMB;
+        if (u < uEnd) {
+            float ud = (u - SWIM_SPLIT) / (uEnd - SWIM_SPLIT);
+            float y  = mix(-HELIX_H, HELIX_H, ud);
+            float rr = HELIX_W * (1.0 - smoothstep(0.85, 1.0, ud));
+            float ph = 6.2831853 * SWIM_HELIX_TURNS * ud + (f < 0.5 ? 0.0 : 3.14159);
+            return vec3(rr * cos(ph), y, rr * sin(ph));
+        }
+        return vec3(0.0, mix(HELIX_H, -HELIX_H, (u - uEnd) / (1.0 - uEnd)), 0.0);
+    }
+    if (sh == 2) {
+        if (u < SWIM_SPLIT) return vec3(0.0);
+        float a = 6.2831853 * (0.5 * ud + (f < 0.5 ? 0.0 : 0.5));
+        return vec3(0.0, cos(a), sin(a)) * RING_R;
+    }
+    if (sh == 3) {
+        if (u < SWIM_SPLIT) return vec3(0.0);
+        float z  = mix(-RING_R, RING_R, ud);
+        float ph = 6.2831853 * SWIM_FACE_TURNS * ud + (f < 0.5 ? 0.0 : 3.14159);
+        return vec3(HELIX_W * cos(ph), HELIX_W * sin(ph), z);
+    }
+    if (sh == 4) {
+        float ab = (u - SWIM_SPLIT) / (1.0 - SWIM_SPLIT);
+        float tri = ab < 2.0 * PUNCH_SHOT ? (ab < PUNCH_SHOT ? ab / PUNCH_SHOT : (2.0 * PUNCH_SHOT - ab) / PUNCH_SHOT) : 0.0;
+        return vec3(0.0, 0.0, (f < 0.5 ? -1.0 : 1.0) * PUNCH_D * tri);
+    }
+    if (sh == 5) {
+        float ab = (u - SWIM_SPLIT) / (1.0 - SWIM_SPLIT);
+        float tri = ab < 2.0 * PUNCH_SHOT ? (ab < PUNCH_SHOT ? ab / PUNCH_SHOT : (2.0 * PUNCH_SHOT - ab) / PUNCH_SHOT) : 1.0;
+        return vec3(0.0, 0.0, (f < 0.5 ? -1.0 : 1.0) * PUNCH_D * tri);
+    }
+    if (sh == 6) {
+        float sx = HELIX_W * (f < 0.5 ? -1.0 : 1.0);
+        if (u < SWIM_SPLIT) return vec3(sx * (u / SWIM_SPLIT), 0.0, 0.0);
+        if (u < 0.5) {
+            float t = (u - SWIM_SPLIT) / (0.5 - SWIM_SPLIT);
+            return vec3(sx, mix(0.0, -HELIX_H, t), 0.0);
+        }
+        float t = (u - 0.5) / 0.5;
+        return vec3(sx, mix(-HELIX_H, HELIX_H, t), 0.0);
+    }
+    if (sh == 7) {
+        float x  = mix(-RING_R, RING_R, u);
+        float sy = 0.16 * (f < 0.5 ? 1.0 : -1.0);
+        return vec3((f < 0.5 ? x : -x), sy, 0.0);
+    }
+    if (sh == 8) {
+        float a = 6.2831853 * u + (f < 0.5 ? 0.0 : 3.14159);
+        float r = 1.0 - 0.5 * (0.5 - 0.5 * cos(7.0 * a));
+        return vec3(cos(a) * r, sin(a) * r, 0.0) * (RING_R * 0.7 * (f < 0.5 ? 1.0 : 0.82));
+    }
+    if (sh == 9) {
+        float a  = 6.2831853 * u;
+        float ph = 6.2831853 * 4.0 * u + (f < 0.5 ? 0.0 : 3.14159);
+        vec3  nrm = vec3(-sin(a), cos(a), 0.0);
+        return vec3(cos(a), sin(a), 0.0) * (RING_R * 0.6 * (f < 0.5 ? 1.0 : 0.82))
+             + (cos(ph) * nrm + sin(ph) * vec3(0.0, 0.0, 1.0)) * HELIX_W;
+    }
+    if (sh == 10) {
+        float a = 6.2831853 * u + (f < 0.5 ? 0.0 : 3.14159);
+        return vec3(cos(a), 0.72 * sin(a), 0.0) * (RING_R * (f < 0.5 ? 1.0 : 0.82));
+    }
+    if (sh == 11) {
+        float a = 6.2831853 * u + (f < 0.5 ? 0.0 : 1.5707963);
+        return vec3(sin(2.0 * a), sin(3.0 * a + 0.7854), 0.14 * cos(5.0 * a))
+             * (RING_R * 0.68 * (f < 0.5 ? 1.0 : 0.86));
+    }
+    if (sh == 12) {
+        float a = 6.2831853 * u + (f < 0.5 ? 0.0 : 0.6283185);
+        vec2  p = 0.58 * vec2(cos(2.0 * a), sin(2.0 * a))
+                + 0.38 * vec2(cos(3.0 * a), -sin(3.0 * a));
+        return vec3(p, 0.10 * sin(5.0 * a)) * (RING_R * 0.78 * (f < 0.5 ? 1.0 : 0.85));
+    }
+    if (sh == 13) {
+        float a = 6.2831853 * u + (f < 0.5 ? 0.0 : 3.14159);
+        float r = 0.62 + 0.32 * cos(3.0 * a);
+        return vec3(r * cos(2.0 * a), r * sin(2.0 * a), 0.16 * sin(3.0 * a)) * (RING_R * 0.75);
+    }
+    if (sh == 14) {
+        float a = 6.2831853 * u + (f < 0.5 ? 0.0 : 3.14159);
+        float r = 0.48 - 0.22 * cos(4.0 * a) + 0.26 * pow(sin(2.0 * a), 2.0);
+        return vec3(sin(a) * r, cos(a) * (r + 0.18 * cos(2.0 * a)), 0.10 * sin(4.0 * a))
+             * (RING_R * 1.05 * (f < 0.5 ? 1.0 : 0.84));
+    }
+    if (sh == 15) {
+        float a = 6.2831853 * u + (f < 0.5 ? 0.0 : 0.7853982);
+        vec2  p = 0.68 * vec2(cos(a), sin(a)) - 0.28 * vec2(cos(5.0 * a), sin(5.0 * a));
+        return vec3(p, 0.12 * cos(4.0 * a)) * (RING_R * 0.74 * (f < 0.5 ? 1.0 : 0.78));
+    }
+    if (u < SWIM_SPLIT) return vec3(0.0);
+    float a = 6.2831853 * (0.5 * ud + (f < 0.5 ? 0.0 : 0.5));
+    return vec3(cos(a), 0.0, sin(a)) * RING_R;
+}
+float figBeats(float id) {
+    return (abs(id - 1.0) < 0.5) ? FORM_HELIX_BEATS : FORM_DEMO_BEATS;
+}
+int pickFigure(vec4 A, vec4 B, float R, float spd, float cur, float salt, bool fireSpecial, float repeat,
+               float lastSp, float win) {
+    if (fireSpecial) {
+        float sc[8];
+        sc[0] = 0.8 * A.y + 0.4 * (1.0 - A.z);
+        sc[1] = 0.7 * A.z + 0.5 * A.x;
+        sc[2] = 0.8 * A.y + 0.4 * B.x;
+        sc[3] = 0.7 * A.z + 0.5 * A.w;
+        sc[4] = 1.1 * B.w + 0.4 * A.x;
+        sc[5] = 0.9 * B.w + 0.5 * B.z;
+        sc[6] = 0.8 * A.y + 0.7 * B.w;
+        sc[7] = 0.7 * B.x + 0.6 * A.z;
+        int bestSp = 1; float bs = -1e9;
+        for (int i = 0; i < 8; i++) {
+            if (i == 6) continue;
+            float noRep = (abs(float(i) - lastSp) < 0.5 || abs(float(i) - cur) < 0.5) ? -1.5 : 0.0;
+            float v = sc[i] + 0.45 * hash11(salt * 13.7 + float(i)) + noRep;
+            if (v > bs) { bs = v; bestSp = i; }
+        }
+        return bestSp;
+    }
+
+    float mus[8];
+    mus[0] = 0.6 * A.z + 0.4 * (1.0 - A.x);
+    mus[1] = 0.6 * B.x + 0.5 * A.z;
+    mus[2] = 0.8 * (1.0 - A.z) + 0.4 * (1.0 - B.w);
+    mus[3] = 0.7 * A.z + 0.5 * B.y;
+    mus[4] = 0.7 * A.w + 0.5 * B.x;
+    mus[5] = 0.6 * B.z + 0.5 * A.y;
+    mus[6] = 0.6 * B.y + 0.5 * A.w;
+    mus[7] = 0.6 * A.x + 0.5 * A.z;
+    int best = 8; float bs = -1e9;
+    for (int n = 0; n < 8; n++) {
+        int id = 8 + n;
+        float samePen = (abs(float(id) - cur) < 0.5) ? -1.2 : 0.0;
+        float v = 1.6 * mus[n] + 0.45 * hash11(salt * 7.3 + float(n)) + samePen;
+        if (v > bs) { bs = v; best = id; }
+    }
+    return best;
+}
+vec3 rotAxis(vec3 v, vec3 n, float a) {
+    float c = cos(a), s = sin(a);
+    return v * c + cross(n, v) * s + n * dot(n, v) * (1.0 - c);
+}
+#define PAL_N 19
+const vec3 PAL_COL[19] = vec3[19](
+    vec3(0.12, 1.00, 0.70),
+    vec3(0.30, 0.00, 1.65),
+    vec3(0.00, 0.90, 0.90),
+    vec3(1.20, 0.00, 1.00),
+    vec3(1.20, 0.60, 0.05),
+    vec3(0.10, 0.15, 1.60),
+    vec3(1.30, 0.05, 0.15),
+    vec3(1.20, 0.45, 0.00),
+    vec3(0.55, 0.85, 1.10),
+    vec3(0.25, 0.00, 1.40),
+    vec3(1.20, 0.85, 0.10),
+    vec3(0.00, 1.00, 0.35),
+    vec3(1.30, 0.10, 0.60),
+    vec3(0.00, 0.95, 1.00),
+    vec3(0.45, 0.00, 1.60),
+    vec3(0.25, 0.35, 0.70),
+    vec3(1.30, 0.08, 0.08),
+    vec3(0.70, 0.02, 0.04),
+    vec3(0.05, 0.50, 0.30));
+const vec3 PAL_MOOD[19] = vec3[19](
+    vec3(0.40, 0.55, 0.30),
+    vec3(0.45, 0.35, 0.45),
+    vec3(0.50, 0.70, 0.30),
+    vec3(0.70, 0.65, 0.55),
+    vec3(0.60, 0.55, 0.30),
+    vec3(0.35, 0.30, 0.40),
+    vec3(0.85, 0.40, 0.80),
+    vec3(0.75, 0.60, 0.50),
+    vec3(0.20, 0.70, 0.15),
+    vec3(0.30, 0.25, 0.45),
+    vec3(0.55, 0.90, 0.30),
+    vec3(0.45, 0.65, 0.25),
+    vec3(0.80, 0.80, 0.55),
+    vec3(0.55, 0.85, 0.35),
+    vec3(0.50, 0.15, 0.80),
+    vec3(0.35, 0.20, 0.60),
+    vec3(0.90, 0.35, 0.90),
+    vec3(0.85, 0.15, 0.85),
+    vec3(0.25, 0.30, 0.25));
+#define UNI_HOT_A   16
+#define UNI_HOT_B   17
+#define UNI_CALM_A   0
+#define UNI_CALM_B  18
+#define UNI_HEAT    0.5
+#define UNI_LO      0.35
+#define UNI_HI      0.65
+#define PAL_FIT_K      3.0
+#define PAL_SAME_PEN   2.0
+#define PAL_HUE_BONUS  0.6
+#define PAL_PARTNER_MIN 40.0
+#define PAL_PARTNER_PEN 3.0
+#define PAL_RND        0.25
+#define WHITE_GAIN     1.0
+float hueOf(vec3 c) { return degrees(atan(1.7320508 * (c.g - c.b), 2.0 * c.r - c.g - c.b)); }
+float hueDist(vec3 a, vec3 b) { float d = abs(hueOf(a) - hueOf(b)); return min(d, 360.0 - d); }
+int pickSingle(vec3 mood, int cur, int partner, float salt) {
+    int best = cur; float bs = -1e9;
+    for (int i = 0; i < PAL_N; i++) {
+        float v = -PAL_FIT_K * length(mood - PAL_MOOD[i])
+                - (i == cur ? PAL_SAME_PEN : 0.0)
+                - (i == partner ? PAL_PARTNER_PEN : 0.0)
+                - PAL_PARTNER_PEN * (1.0 - smoothstep(0.0, PAL_PARTNER_MIN, hueDist(PAL_COL[i], PAL_COL[partner])))
+                + PAL_HUE_BONUS * smoothstep(20.0, 60.0, hueDist(PAL_COL[i], PAL_COL[cur]))
+                + PAL_RND * hash11(salt * 5.3 + float(i) * 1.7);
+        if (v > bs) { bs = v; best = i; }
+    }
+    return best;
+}
+float wrapDist(float a, float b) { float d = abs(a - b); return min(d, 1.0 - d); }
+void main() {
+    float dt = iTimeDelta;
+    float dB = dt / max(u_tbeat, 0.2);
+
+    float sb = imageLoad(stImg, ivec2(2, 0)).r;
+    float kickOnset = (u_kick > sb + HAWK_KICK) ? 1.0 : 0.0;
+    sb += (u_kick - sb) * (1.0 - exp(-dt / (u_kick > sb ? F_SEP_ATT : F_SEP_REL)));
+    imageStore(stImg, ivec2(2, 0), vec4(sb));
+    float hawkPrev = imageLoad(stImg, ivec2(15, 0)).r;
+    float hawk = kickOnset > 0.5 ? HAWK_TAU : max(0.0, hawkPrev - dt);
+    imageStore(stImg, ivec2(15, 0), vec4(hawk));
+    float hawkAmt = smoothstep(0.0, HAWK_TAU, hawk);
+    if (kickOnset > 0.5) {
+        float pc = imageLoad(stImg, ivec2(48, 0)).r;
+        for (int w = 0; w < 2; w++) {
+            int slot = PULSE_SLOT0 + int(mod(pc + float(w), float(PULSE_N)));
+            imageStore(wormImg, ivec2(slot, 0), vec4(imageLoad(wormImg, ivec2(w, 0)).xyz, u_time));
+        }
+        imageStore(stImg, ivec2(48, 0), vec4(mod(pc + 2.0, float(PULSE_N))));
+    }
+
+    float pdir = imageLoad(stImg, ivec2(11, 0)).r; pdir = pdir < 0.0 ? -1.0 : 1.0;
+    float scat = imageLoad(stImg, ivec2(12, 0)).r;
+    float sseen = imageLoad(stImg, ivec2(14, 0)).r;
+    if (u_ms_change != sseen) {
+        sseen = u_ms_change;
+        imageStore(stImg, ivec2(14, 0), vec4(sseen));
+        if (u_ms_sec_b.w > SCATTER_IMPACT || u_ms_cur_b.w > SCATTER_IMPACT) { pdir = -pdir; scat = SCATTER_BEATS; }
+    }
+    float spd = 1.0 + SCATTER_SPD * smoothstep(0.0, SCATTER_BEATS, scat) + HAWK_SPD * hawkAmt;
+    float pb = imageLoad(stImg, ivec2(13, 0)).r + pdir * spd * dB;
+    imageStore(stImg, ivec2(13, 0), vec4(pb));
+    imageStore(stImg, ivec2(11, 0), vec4(pdir));
+    imageStore(stImg, ivec2(12, 0), vec4(max(0.0, scat - dB)));
+    float hi = imageLoad(stImg, ivec2(0, 0)).r;
+    hi += (max(u_presence, u_brilliance) - hi) * (1.0 - exp(-dt / F_HI_TAU));
+    imageStore(stImg, ivec2(0, 0), vec4(hi));
+    float spin = 6.2831853 * pb / ORBIT_BEATS;
+
+    float state  = imageLoad(stImg, ivec2(3, 0)).r;
+    float seen   = imageLoad(stImg, ivec2(4, 0)).r;
+    float target = imageLoad(stImg, ivec2(5, 0)).r;
+    if (u_ms_change != seen) {
+        seen = u_ms_change;
+        target = pickMode(u_ms_sec_a, u_ms_sec_b);
+    }
+    if (u_ms_source > 0.5 && u_ms_next_in > 0.0 && u_ms_next_in < PUSH_EARLY && u_ms_next_a.x >= 0.0)
+        target = pickMode(u_ms_next_a, u_ms_next_b);
+    float d = target - state;
+    d -= N_MODES * floor(d / N_MODES + 0.5);
+    if (abs(d) > 0.05) state += sign(d) * min(PUSH_RATE * dB, abs(d));
+    else state += (-sin(state * 6.2831853) * WELL_G / 6.2831853) * dB;
+    state += KICK_WOBBLE * u_kick * u_kick * u_kick * sin(spin * 2.0) * dB;
+    state = mod(state, N_MODES);
+    imageStore(stImg, ivec2(3, 0), vec4(state));
+    imageStore(stImg, ivec2(4, 0), vec4(seen));
+    imageStore(stImg, ivec2(5, 0), vec4(target));
+    float wA = max(0.0, 1.0 - circDist(state, 0.0));
+    float wB = max(0.0, 1.0 - circDist(state, 1.0));
+    float wC = max(0.0, 1.0 - circDist(state, 2.0));
+    float wD = max(0.0, 1.0 - circDist(state, 3.0));
+    float wE = max(0.0, 1.0 - circDist(state, 4.0));
+
+    float pocket = imageLoad(stImg, ivec2(7, 0)).r;
+    pocket += (POCKET_MAX * u_ms_cur_a.z - pocket) * (1.0 - exp(-dt / POCKET_TAU));
+    imageStore(stImg, ivec2(7, 0), vec4(pocket));
+    float hat = imageLoad(stImg, ivec2(6, 0)).r;
+    float hatHit = (u_drum_high > hat + HAT_HIT) ? 1.0 : 0.0;
+    hat = max(u_drum_high, hat * exp(-dt / HAT_REL));
+    imageStore(stImg, ivec2(6, 0), vec4(hat));
+    float roll = imageLoad(stImg, ivec2(10, 0)).r + HAT_SPIN * hatHit + HAWK_SPIN * (hawk > 0.0 ? dt : 0.0);
+    imageStore(stImg, ivec2(10, 0), vec4(roll));
+    imageStore(wormImg, ivec2(4, 0), vec4(roll, 0.0, 0.0, 1.0));
+    float windup = (u_ms_source > 0.5 && u_ms_drop_in > 0.0)
+        ? 1.0 - smoothstep(0.0, WINDUP_BEATS * u_tbeat, u_ms_drop_in) : 0.0;
+
+    float t = pb * BIN_T;
+    float loud = clamp(0.5 * u_ms_cur_a.x + 0.5 * sb, 0.0, 1.0);
+    float sep0 = BIN_SEP0 + BIN_SEP1 * pow(sin(t * 0.5), 4.0) + BIN_KICK_SEP * sb;
+    float press = imageLoad(stImg, ivec2(1, 0)).r;
+    float close = 1.0 - smoothstep(SPONGE_NEAR, SPONGE_FAR, sep0);
+    press += (close - press) * (1.0 - exp(-dB / SPONGE_BEATS));
+    imageStore(stImg, ivec2(1, 0), vec4(press));
+
+    float tiltPose = mod(u_ms_change, 4.0);
+    float figEdge, figBlade;
+    if      (tiltPose < 0.5) { figEdge =  TILT_DEG;  figBlade = 0.0; }
+    else if (tiltPose < 1.5) { figEdge = -TILT_DEG;  figBlade = 0.0; }
+    else if (tiltPose < 2.5) { figEdge =  FIG_EDGE1; figBlade = 0.0; }
+    else                     { figEdge =  FIG_EDGE1; figBlade = FIG_EDGE1; }
+    float calmNow  = (pickMode(u_ms_sec_a, u_ms_sec_b) < 0.5) ? 1.0 : 0.0;
+    float camLockT = (FIG_CAMLOCK < 0.5) ? 0.0 : ((FIG_CAMLOCK < 1.5) ? 1.0 : 1.0 - NAT_CALM * calmNow);
+    float figCamLock = imageLoad(stImg, ivec2(54, 0)).r;
+    figCamLock += (camLockT - figCamLock) * (1.0 - exp(-dB / NAT_BEATS));
+    imageStore(stImg, ivec2(54, 0), vec4(figCamLock));
+    float lane  = mod(floor(pb / FIG_LANE_BEATS), FIG_LANE_N);
+    float laneZ = FIG_LANE_Z0 + lane * FIG_LANE_DZ;
+    vec3 fig = headOffAt(pb, vec4(wA, wB, wC, wD), wE, pocket, vec3(sb, press, windup), 0.0, 0.0, figCamLock, laneZ, loud);
+    float pir = 6.2831853 * pb / PIR_BEATS;
+    vec3 po = vec3(cos(pir), sin(pir), 0.0) * PIR_R * clamp(0.6 * hat + 0.4 * u_ms_cur_a.w, 0.0, 1.0);
+    float tumble = t * 1.2;
+    po.xy = mat2(cos(tumble), -sin(tumble), sin(tumble), cos(tumble)) * po.xy;
+    fig += po;
+
+    vec3 baseP = softCore(fig);
+    vec3 p0 = baseP;
+    float pR = 1.0, pSpd = 0.0;
+    {
+        const int NP = 49;
+        float stepB = (PRED_BACK + PRED_FWD) / float(NP - 1);
+        vec3  pP[NP];
+        float pA[NP];
+        for (int n = 0; n < NP; n++)
+            pP[n] = headOffAt(u_beat_count - PRED_BACK + float(n) * stepB,
+                              vec4(wA, wB, wC, wD), wE, pocket, vec3(sb, press, windup), 0.0, 0.0, figCamLock, 0.0, loud);
+        pA[0] = 0.0;
+        for (int n = 1; n < NP; n++) pA[n] = pA[n - 1] + length(pP[n] - pP[n - 1]);
+        int i0 = int(round(PRED_BACK / stepB));
+        float kMax = 0.0;
+        for (int n = i0 + 1; n < NP - 1; n++) {
+            vec3 uu = pP[n] - pP[n - 1], vv = pP[n + 1] - pP[n], ww = pP[n + 1] - pP[n - 1];
+            float den = length(uu) * length(vv) * length(ww);
+            if (den > 1e-9) kMax = max(kMax, 2.0 * length(cross(uu, vv)) / den);
+        }
+        pR = 1.0 / max(kMax, 1e-3);
+        int i1 = min(i0 + 4, NP - 1);
+        pSpd = (pA[i1] - pA[i0]) / (float(i1 - i0) * stepB);
+    }
+    float teamW = 0.0;
+    vec3  p1t   = p0;
+    float figActive = 0.0;
+    {
+        float figPhase = imageLoad(stImg, ivec2(53, 0)).r;
+        float swA = imageLoad(stImg, ivec2(38, 0)).r, swB = imageLoad(stImg, ivec2(39, 0)).r;
+        float swM = imageLoad(stImg, ivec2(40, 0)).r;
+        figPhase += dB / figBeats(swB);
+        if (figPhase >= 1.0) {
+            figPhase -= 1.0;
+            float figN = imageLoad(stImg, ivec2(41, 0)).r + 1.0;
+            imageStore(stImg, ivec2(41, 0), vec4(figN));
+
+            float spCool    = max(0.0, imageLoad(stImg, ivec2(50, 0)).r - 1.0);
+            float spSecSeen = imageLoad(stImg, ivec2(51, 0)).r;
+            float lastSp    = imageLoad(stImg, ivec2(52, 0)).r;
+
+            bool secChanged = (u_ms_change != spSecSeen);
+            if (secChanged) imageStore(stImg, ivec2(51, 0), vec4(u_ms_change));
+
+            bool heavySec   = u_ms_sec_a.x >= SPECIAL_E && (u_ms_sec_a.y >= SPECIAL_W || u_ms_sec_b.w >= SPECIAL_I);
+            bool secPunch   = secChanged && (u_ms_sec_b.w >= 0.28 || (u_ms_sec_a.x >= 0.68 && u_ms_sec_a.y >= 0.48));
+            bool phrasePeak = heavySec && (mod(figN, 3.0) < 0.5);
+            bool livePeak   = (u_ms_cur_a.x * max(u_ms_cur_b.w, 0.0) + 0.35 * sb) > 0.68;
+
+            bool fireSpecial = (spCool < 0.5) && (secPunch || phrasePeak || livePeak);
+
+            swA = swB;
+            swB = float(pickFigure(u_ms_sec_a, u_ms_sec_b, pR, pSpd, swB, figN, fireSpecial, u_ms_repeat, lastSp, figN));
+            if (swB < 7.5) {
+                spCool = 2.0;
+                imageStore(stImg, ivec2(52, 0), vec4(swB));
+            }
+            imageStore(stImg, ivec2(50, 0), vec4(spCool));
+
+            swM = 0.0;
+            imageStore(stImg, ivec2(38, 0), vec4(swA));
+            imageStore(stImg, ivec2(39, 0), vec4(swB));
+        }
+        imageStore(stImg, ivec2(53, 0), vec4(figPhase));
+        float uu = figPhase;
+        swM = min(1.0, swM + dB / FORM_MORPH_BEATS);
+        imageStore(stImg, ivec2(40, 0), vec4(swM));
+        float sm = smoothstep(0.0, 1.0, swM);
+        bool isTeam = (swB > 3.5 && swB < 7.5);
+        if (isTeam) sm = 1.0;
+        vec3 s0 = mix(swimSlot(int(swA + 0.5), uu, 0.0, u_beat_count),
+                      swimSlot(int(swB + 0.5), uu, 0.0, u_beat_count), sm);
+        vec3 s1 = mix(swimSlot(int(swA + 0.5), uu, 1.0, u_beat_count),
+                      swimSlot(int(swB + 0.5), uu, 1.0, u_beat_count), sm);
+        {
+            float fc = cos(FIG_ROT), fs = sin(FIG_ROT);
+            s0.xy = mat2(fc, -fs, fs, fc) * s0.xy;
+            s1.xy = mat2(fc, -fs, fs, fc) * s1.xy;
+        }
+        {
+            vec3  tn  = vec3(cos(figBlade), sin(figBlade), 0.0);
+            float tce = cos(figEdge), tse = sin(figEdge);
+            s0 = s0 * tce + cross(tn, s0) * tse + tn * dot(tn, s0) * (1.0 - tce);
+            s1 = s1 * tce + cross(tn, s1) * tse + tn * dot(tn, s1) * (1.0 - tce);
+        }
+        p0   = baseP + transpose(camRot()) * s0;
+        p1t  = baseP + transpose(camRot()) * s1;
+        teamW = 0.0;
+        figActive = 0.0;
+    }
+    float rushT   = imageLoad(stImg, ivec2(24, 0)).r;
+    float rushSee = imageLoad(stImg, ivec2(28, 0)).r;
+    if (u_ms_change != rushSee) {
+        imageStore(stImg, ivec2(28, 0), vec4(u_ms_change));
+        if (u_ms_sec_b.w > SCATTER_IMPACT || u_ms_cur_b.w > SCATTER_IMPACT) {
+            rushT = RUSH_BEATS;
+            imageStore(stImg, ivec2(25, 0), vec4(p0, 1.0));
+        }
+    }
+    if (rushT > 0.0) {
+        float u  = clamp(1.0 - rushT / RUSH_BEATS, 0.0, 1.0);
+        vec3  A  = imageLoad(stImg, ivec2(25, 0)).xyz;
+        vec3  Bm = -A;
+        vec3  near = mix(A, Bm, 1.0 - RUSH_SHORT);
+        p0 = mix(mix(A, near, smoothstep(0.0, 0.5, u)),
+                 mix(near, Bm, smoothstep(0.5, 1.0, u)), step(0.5, u));
+        teamW = 0.0; figActive = 0.0;
+        imageStore(stImg, ivec2(24, 0), vec4(max(0.0, rushT - dB)));
+    }
+    float gooT   = imageLoad(stImg, ivec2(29, 0)).r;
+    float dropSeen = imageLoad(stImg, ivec2(30, 0)).r;
+    float dropIn = u_ms_drop_in;
+    if (dropSeen > 0.0 && dropSeen < 1.0 && (dropIn < 0.0 || dropIn > dropSeen + 1.0)) {
+        float dc = imageLoad(stImg, ivec2(37, 0)).r + 1.0;
+        imageStore(stImg, ivec2(37, 0), vec4(dc));
+        if (mod(dc, 2.0) < 1.0) gooT = GOO_BEATS;
+        else imageStore(stImg, ivec2(32, 0), vec4(STIR_BEATS));
+    }
+    imageStore(stImg, ivec2(30, 0), vec4(dropIn));
+    if (gooT > 0.0) {
+        float g = smoothstep(0.0, GOO_ATT, GOO_BEATS - gooT)
+                * (1.0 - smoothstep(GOO_BEATS - GOO_REL, GOO_BEATS, gooT));
+        float ang = imageLoad(stImg, ivec2(31, 0)).r + GOO_W * g * dt;
+        imageStore(stImg, ivec2(31, 0), vec4(ang));
+        float R = GOO_R * g;
+        p0 = transpose(camRot()) * vec3(R * cos(ang), R * sin(ang), GOO_Z * g);
+        teamW = 0.0; figActive = 0.0;
+        imageStore(stImg, ivec2(29, 0), vec4(max(0.0, gooT - dB)));
+    }
+    float stirT = imageLoad(stImg, ivec2(32, 0)).r;
+    if (stirT > 0.0) {
+        float clk = imageLoad(stImg, ivec2(34, 0)).r + dt;
+        imageStore(stImg, ivec2(34, 0), vec4(clk));
+        float p    = clamp(1.0 - stirT / STIR_BEATS, 0.0, 1.0);
+        float gIn  = smoothstep(0.0, 1.0, STIR_BEATS - stirT);
+        float rise = smoothstep(0.0, 0.62, p);
+        float exit = smoothstep(0.64, 1.0, p);
+        float y    = (rise - 0.5) * 2.0 * TORN_H * gIn + exit * TORN_EXIT_H;
+        float rr   = (TORN_R0 + TORN_R1 * rise) * gIn + exit * TORN_EXIT_R;
+        float th   = clk * TORN_W;
+        p0  = transpose(camRot()) * vec3(rr * cos(th), y, rr * sin(th));
+        p1t = transpose(camRot()) * vec3(rr * cos(th + TORN_LEAD), y, rr * sin(th + TORN_LEAD));
+        teamW = 1.0;
+        imageStore(stImg, ivec2(32, 0), vec4(max(0.0, stirT - dB)));
+    }
+    {
+        float imp  = max(u_ms_sec_b.w, 0.0);
+        float tens = u_ms_sec_b.z >= 0.0 ? 0.5 * (u_ms_sec_b.z + imp) : imp;
+        vec3 mood = vec3(0.5 * (max(u_ms_sec_a.x, 0.0) + max(u_ms_sec_a.y, 0.0)),
+                         0.5 * (max(u_ms_sec_a.w, 0.0) + max(u_ms_sec_b.y, 0.0)),
+                         tens);
+        float c0 = imageLoad(stImg, ivec2(55, 0)).r, c1 = imageLoad(stImg, ivec2(56, 0)).r;
+        float seen = imageLoad(stImg, ivec2(57, 0)).r;
+        float n0 = imageLoad(stImg, ivec2(58, 0)).r, n1 = imageLoad(stImg, ivec2(59, 0)).r;
+        float flag = imageLoad(stImg, ivec2(63, 0)).r;
+        if (flag < 0.5) {
+            c0 = 0.0; c1 = 1.0; n0 = 0.0; n1 = 1.0; flag = 2.0; seen = u_ms_change;
+            imageStore(stImg, ivec2(55, 0), vec4(c0)); imageStore(stImg, ivec2(56, 0), vec4(c1));
+            imageStore(stImg, ivec2(58, 0), vec4(n0)); imageStore(stImg, ivec2(59, 0), vec4(n1));
+            imageStore(stImg, ivec2(57, 0), vec4(seen));
+            imageStore(stImg, ivec2(60, 0), vec4(mood.x)); imageStore(stImg, ivec2(61, 0), vec4(mood.y));
+            imageStore(stImg, ivec2(62, 0), vec4(mood.z));
+        }
+        if (u_ms_change != seen) {
+            seen = u_ms_change;
+            vec3 moodPrev = vec3(imageLoad(stImg, ivec2(60, 0)).r, imageLoad(stImg, ivec2(61, 0)).r,
+                                 imageLoad(stImg, ivec2(62, 0)).r);
+            int last = int(flag + 0.5) - 1;
+            bool hard = (moodPrev.x < UNI_LO && mood.x > UNI_HI) || (moodPrev.x > UNI_HI && mood.x < UNI_LO);
+            if (hard) {
+                bool hot = mood.x > UNI_HEAT;
+                n0 = float(hot ? UNI_HOT_A : UNI_CALM_A);
+                n1 = float(hot ? UNI_HOT_B : UNI_CALM_B);
+            } else if (last == 0) {
+                n1 = float(pickSingle(mood, int(c1 + 0.5), int(c0 + 0.5), u_ms_change));
+                flag = 2.0;
+            } else {
+                n0 = float(pickSingle(mood, int(c0 + 0.5), int(c1 + 0.5), u_ms_change));
+                flag = 1.0;
+            }
+            imageStore(stImg, ivec2(57, 0), vec4(seen));
+            imageStore(stImg, ivec2(58, 0), vec4(n0)); imageStore(stImg, ivec2(59, 0), vec4(n1));
+            imageStore(stImg, ivec2(60, 0), vec4(mood.x)); imageStore(stImg, ivec2(61, 0), vec4(mood.y));
+            imageStore(stImg, ivec2(62, 0), vec4(mood.z));
+        }
+        imageStore(stImg, ivec2(63, 0), vec4(flag));
+        float beatPrev = imageLoad(stImg, ivec2(23, 0)).r, beatNow = floor(u_beat_count);
+        if (beatNow != beatPrev) {
+            c0 = n0; c1 = n1;
+            imageStore(stImg, ivec2(23, 0), vec4(beatNow));
+            imageStore(stImg, ivec2(55, 0), vec4(c0)); imageStore(stImg, ivec2(56, 0), vec4(c1));
+        }
+        float white = (rushT > 0.0 || gooT > 0.0) ? 1.0 : 0.0;
+        imageStore(wormImg, ivec2(5, 0), vec4(c0, white, c1, 1.0));
+        imageStore(wormImg, ivec2(6, 0), vec4(PAL_COL[int(c0 + 0.5)], 1.0));
+        imageStore(wormImg, ivec2(7, 0), vec4(PAL_COL[int(c1 + 0.5)], 1.0));
+    }
+    vec3 c0 = camRot() * p0;
+    for (int k = 0; k < 2; k++) {
+        vec4 now = imageLoad(wormImg, ivec2(k, 0));
+        vec3 p;
+        {
+            vec3 c = (k == 0) ? c0 : (mix(-c0, camRot() * p1t, teamW));
+            c.x *= SQUISH_X;
+            c.z = mix(c.z, sqrt(c.z * c.z + FIG_MIRROR_K * FIG_MIRROR_K), figCamLock * (1.0 - figActive));
+            p = transpose(camRot()) * c;
+        }
+        p = inside(p);
+        imageStore(wormImg, ivec2(2 + k, 0), now.w > 0.5 ? now : vec4(p, 1.0));
+        imageStore(wormImg, ivec2(k, 0), vec4(p, 1.0));
+    }
+}
+#endif
+
+#if defined(K_CLEAR) || defined(K_PART) || defined(K_DINO)
+layout(local_size_x = 16, local_size_y = 16) in;
+uniform ivec2 u_canvas;
+#endif
+
+#ifdef K_CLEAR
+layout(r32ui, binding = 0) uniform writeonly uimage2D accRImg;
+layout(r32ui, binding = 1) uniform writeonly uimage2D accGImg;
+layout(r32ui, binding = 2) uniform writeonly uimage2D accBImg;
+void main() {
+    ivec2 p = ivec2(gl_GlobalInvocationID.xy);
+    if (p.x < u_canvas.x && p.y < u_canvas.y) {
+        imageStore(accRImg, p, uvec4(0u));
+        imageStore(accGImg, p, uvec4(0u));
+        imageStore(accBImg, p, uvec4(0u));
+    }
+}
+#endif
+
+#ifdef K_STIR
+layout(local_size_x = 8, local_size_y = 8, local_size_z = 8) in;
+layout(r16f, binding = 0) uniform writeonly image3D stirImg;
+uniform sampler3D u_vel;
+void main() {
+    ivec3 p = cellId();
+    if (outside(p)) return;
+    ivec3 lo = ivec3(0), hi = ivec3(u_n - 1);
+    float h = cellH();
+    vec3 gx = texelFetch(u_vel, clamp(p + NB[0], lo, hi), 0).xyz - texelFetch(u_vel, clamp(p + NB[1], lo, hi), 0).xyz;
+    vec3 gy = texelFetch(u_vel, clamp(p + NB[2], lo, hi), 0).xyz - texelFetch(u_vel, clamp(p + NB[3], lo, hi), 0).xyz;
+    vec3 gz = texelFetch(u_vel, clamp(p + NB[4], lo, hi), 0).xyz - texelFetch(u_vel, clamp(p + NB[5], lo, hi), 0).xyz;
+    imageStore(stirImg, p, vec4(sqrt(dot(gx, gx) + dot(gy, gy) + dot(gz, gz)) / (2.0 * h)));
+}
+#endif
+
+#if defined(K_PART) || defined(K_DINO)
+layout(r32ui, binding = 1) uniform uimage2D accRImg;
+layout(r32ui, binding = 2) uniform uimage2D accGImg;
+layout(r32ui, binding = 3) uniform uimage2D accBImg;
+uniform sampler3D u_vel;
+uniform sampler3D u_stir;
+#define SPLAT_K    256.0
+#define WHITE_GAIN 1.0
+#define KEEP_F     0.98
+#define PERSP0     0.6333
+#define SPLAT_R_OLD 2.0
+vec3 velAt(vec3 x) { return texture(u_vel, toUVW(x)).xyz; }
+float stirAt(vec3 x) { return texture(u_stir, toUVW(x)).r; }
+void addRGB(ivec2 q, vec3 w, inout uint rs) {
+    if (any(lessThan(q, ivec2(0))) || any(greaterThanEqual(q, u_canvas))) return;
+    rs = pcg(rs);
+    uvec3 a = uvec3(max(w + float(rs & 0xffffu) / 65536.0, 0.0));
+    if (a.x > 0u) imageAtomicAdd(accRImg, q, a.x);
+    if (a.y > 0u) imageAtomicAdd(accGImg, q, a.y);
+    if (a.z > 0u) imageAtomicAdd(accBImg, q, a.z);
+}
+void splatRGB(vec2 px, float hw, vec3 wgt, uint rs) {
+    ivec2 p0 = ivec2(floor(px));
+    vec2 f = px - vec2(p0);
+    if (hw <= 1.001) {
+        for (int k = 0; k < 4; k++) {
+            ivec2 o = ivec2(k & 1, k >> 1);
+            float bw = (o.x == 1 ? f.x : 1.0 - f.x) * (o.y == 1 ? f.y : 1.0 - f.y);
+            addRGB(p0 + o, wgt * bw, rs);
+        }
+        return;
+    }
+    ivec2 lo = ivec2(ceil(px - hw)), hi = ivec2(floor(px + hw));
+    float wsum = 0.0;
+    for (int y = lo.y; y <= hi.y; y++)
+        for (int x = lo.x; x <= hi.x; x++) {
+            vec2 d = abs(vec2(x, y) - px) / hw;
+            wsum += max(1.0 - d.x, 0.0) * max(1.0 - d.y, 0.0);
+        }
+    vec3 norm = wgt / max(wsum, 1e-6);
+    for (int y = lo.y; y <= hi.y; y++)
+        for (int x = lo.x; x <= hi.x; x++) {
+            vec2 d = abs(vec2(x, y) - px) / hw;
+            addRGB(ivec2(x, y), norm * max(1.0 - d.x, 0.0) * max(1.0 - d.y, 0.0), rs);
+        }
+}
+#define DINO_W     2048
+#define DINO_H     2048
+#define DINO_N     (DINO_W * DINO_H)
+#define DINO_TAKE  4
+#define DINO_S0    3.0
+#define DINO_S1   10.0
+#define DINO_TAU   1.5
+#define DINO_GAIN  0.6
+#define DINO_HW    1.5
+#define DINO_EMBER0    0.35
+#define DINO_EMBER_TAU 15.0
+#endif
+
+#ifdef K_PART
+layout(rgba32f, binding = 0) uniform image2D partImg;
+layout(rgba16f, binding = 4) uniform image2D colImg;
+layout(rgba16f, binding = 5) uniform writeonly image2D dposImg;
+layout(rgba16f, binding = 6) uniform writeonly image2D dcolImg;
+layout(r32ui,   binding = 7) uniform uimage2D dcurImg;
+uniform sampler2D u_worm;
+uniform int u_pw, u_ph, u_np, u_emitStart, u_emitN, u_emitN1;
+uniform float u_beat_count;
+uniform int iFrame;
+#define EMIT_R     0.016
+#define EMIT_W     0.030
+#define EMIT_T     0.003
+#define RIB_TWIST  0.125
+#define EMIT_R_FW  0.006
+#define DIFF       2.0e-5
+#define GLOW_HOLD  3.0
+#define GLOW_TAU   6.51
+#define GLOW_END0  18.0
+#define GLOW_END1  20.0
+#define IGN_S0     3.0
+#define IGN_S1    10.0
+#define IGN_TAU    1.5
+#define IGN_GAIN   1.0
+#define BODY_FRAC 0.0
+#define BODY_NOSE 0.030
+#define BODY_BACK 0.018
+#define BODY_W    0.022
+#define BODY_T    0.004
+
+vec3 gauss3(inout uint s) {
+    float u1 = max(rnd(s), 1e-7), u2 = rnd(s), u3 = max(rnd(s), 1e-7), u4 = rnd(s);
+    float r1 = sqrt(-2.0 * log(u1)), r2 = sqrt(-2.0 * log(u3));
+    return vec3(r1 * cos(6.2831853 * u2), r1 * sin(6.2831853 * u2), r2 * cos(6.2831853 * u4));
+}
+
+void main() {
+    ivec2 ip = ivec2(gl_GlobalInvocationID.xy);
+    if (ip.x >= u_pw || ip.y >= u_ph) return;
+    int i = ip.y * u_pw + ip.x;
+    uint seed = pcg(uint(i) * 1664525u + uint(iFrame) * 1013904223u);
+    vec4 P = imageLoad(partImg, ip);
+    int rel = (i - u_emitStart + u_np) % u_np;
+    vec3  col;
+    float ign = 0.0;
+    if (rel < u_emitN + u_emitN1) {
+        int w = rel < u_emitN ? 0 : 1;
+        vec4 sl5 = texelFetch(u_worm, ivec2(5, 0), 0);
+        col = sl5.y > 0.5 ? vec3(WHITE_GAIN) : texelFetch(u_worm, ivec2(6 + w, 0), 0).rgb;
+        int nw = w == 0 ? u_emitN : u_emitN1, r0 = w == 0 ? rel : rel - u_emitN;
+        float fr = (float(r0) + rnd(seed)) / float(nw);
+        vec3 a = texelFetch(u_worm, ivec2(2 + w, 0), 0).xyz;
+        vec3 b = texelFetch(u_worm, ivec2(w, 0), 0).xyz;
+        vec3 dir = b - a;
+        dir = dot(dir, dir) > 1e-12 ? normalize(dir) : vec3(0.0, 0.0, 1.0);
+        vec3 s1 = normalize(cross(dir, abs(dir.y) < 0.95 ? vec3(0.0, 1.0, 0.0) : vec3(1.0, 0.0, 0.0)));
+        vec3 s2 = cross(dir, s1);
+        float roll = texelFetch(u_worm, ivec2(4, 0), 0).x;
+        float tw = roll + 3.14159 * float(w);
+        vec3 side = cos(tw) * s1 + sin(tw) * s2, nrm = cross(dir, side);
+        vec3 gq = gauss3(seed);
+        vec3 pos;
+        if (fr < BODY_FRAC) {
+            float u = rnd(seed), v = rnd(seed);
+            if (u + v > 1.0) { u = 1.0 - u; v = 1.0 - v; }
+            vec3 tz = nrm * (BODY_T * gq.x);
+            vec3 nose  = b + dir * BODY_NOSE + tz;
+            vec3 wingA = b - dir * BODY_BACK - side * BODY_W + tz;
+            vec3 wingB = b - dir * BODY_BACK + side * BODY_W + tz;
+            pos = nose * (1.0 - u - v) + wingA * u + wingB * v;
+        } else {
+            float fr2 = (fr - BODY_FRAC) / (1.0 - BODY_FRAC);
+            pos = mix(a, b, fr2) + side * EMIT_W * (2.0 * rnd(seed) - 1.0) + nrm * EMIT_T * gq.x + dir * EMIT_T * gq.y;
+        }
+        P = vec4(pos, (1.0 - fr) * u_dt);
+    } else if (P.w >= 0.0) {
+        vec4 cv = imageLoad(colImg, ip);
+        col = cv.rgb;
+        ign = cv.a;
+        vec3 v1 = velAt(P.xyz);
+        vec3 v2 = velAt(P.xyz + 0.5 * u_dt * v1);
+        P.xyz += u_dt * v2 + sqrt(2.0 * DIFF * u_dt) * gauss3(seed);
+        P.w += u_dt;
+        if (P.w > GLOW_HOLD)
+            ign = max(ign * exp(-u_dt / IGN_TAU), smoothstep(IGN_S0, IGN_S1, stirAt(P.xyz)));
+        if (P.w >= GLOW_END1 && P.w - u_dt < GLOW_END1 && (i % DINO_TAKE) == 0) {
+            uint slot = imageAtomicAdd(dcurImg, ivec2(0), 1u) % uint(DINO_N);
+            ivec2 dq = ivec2(int(slot % uint(DINO_W)), int(slot / uint(DINO_W)));
+            imageStore(dposImg, dq, vec4(clamp(P.xyz, -KEEP_F * u_H, KEEP_F * u_H), 0.0));
+            imageStore(dcolImg, dq, vec4(col, max(u_time, 1e-3)));
+        }
+    } else return;
+    P.xyz = clamp(P.xyz, -KEEP_F * u_H, KEEP_F * u_H);
+    imageStore(partImg, ip, P);
+    imageStore(colImg, ip, vec4(col, ign));
+
+    float endF = 1.0 - smoothstep(GLOW_END0, GLOW_END1, P.w);
+    float bright = max(exp(-max(P.w - GLOW_HOLD, 0.0) / GLOW_TAU), IGN_GAIN * ign) * endF;
+    if (bright < 0.002) return;
+    mat3 R = camRot();
+    vec3 sc = project(P.xyz, R);
+    if ((R * P.xyz).z + CAM_D < 0.3) return;
+    float persp = sc.z;
+    sc.z = fogAt(P.xyz, R);
+    vec2 px = (sc.xy * float(u_canvas.y) + vec2(u_canvas)) * 0.5 - 0.5;
+    float hw = mix(1.0, SPLAT_R_OLD, smoothstep(GLOW_HOLD, GLOW_HOLD + 2.0 * GLOW_TAU, P.w));
+    hw *= clamp(persp / PERSP0, 0.55, 1.8);
+    uint rs = pcg(uint(ip.x) * 7919u + uint(ip.y) * 104729u + uint(u_emitStart));
+    splatRGB(px, hw, col * (bright * sc.z * SPLAT_K), rs);
+}
+#endif
+
+#ifdef K_DINO
+layout(rgba16f, binding = 0) uniform image2D dposImg;
+layout(rgba16f, binding = 4) uniform readonly image2D dcolImg;
+uniform sampler2D u_worm;
+uniform int iFrame;
+void main() {
+    ivec2 ip = ivec2(gl_GlobalInvocationID.xy);
+    if (ip.x >= DINO_W || ip.y >= DINO_H) return;
+    vec4 C = imageLoad(dcolImg, ip);
+    if (C.a <= 0.0) return;
+    vec4 D = imageLoad(dposImg, ip);
+    D.xyz = clamp(D.xyz + u_dt * velAt(D.xyz), -KEEP_F * u_H, KEEP_F * u_H);
+    float ember = DINO_EMBER0 * exp(-max(u_time - C.a, 0.0) / DINO_EMBER_TAU);
+    float uv = 0.0;
+    for (int k = 0; k < (PULSE_GAIN > 0.0 ? PULSE_N : 0); k++) {
+        vec4 Pk = texelFetch(u_worm, ivec2(PULSE_SLOT0 + k, 0), 0);
+        float age = u_time - Pk.w;
+        if (Pk.w <= 0.0 || age < 0.0 || age > PULSE_LIFE) continue;
+        float d = abs(length(D.xyz - Pk.xyz) - PULSE_V * age);
+        uv = max(uv, exp(-(d * d) / (PULSE_W * PULSE_W)) * (1.0 - age / PULSE_LIFE));
+    }
+    float ign = max(max(D.w * exp(-u_dt / DINO_TAU), smoothstep(DINO_S0, DINO_S1, stirAt(D.xyz))), PULSE_GAIN * uv);
+    D.w = ign;
+    imageStore(dposImg, ip, D);
+    float bright = max(DINO_GAIN * ign, ember);
+    if (bright < 0.003) return;
+    mat3 R = camRot();
+    vec3 sc = project(D.xyz, R);
+    if ((R * D.xyz).z + CAM_D < 0.3) return;
+    float persp = sc.z;
+    sc.z = fogAt(D.xyz, R);
+    vec2 px = (sc.xy * float(u_canvas.y) + vec2(u_canvas)) * 0.5 - 0.5;
+    float hw = DINO_HW * clamp(persp / PERSP0, 0.55, 1.8);
+    uint rs = pcg(uint(ip.x) * 7919u + uint(ip.y) * 104729u + uint(iFrame) * 2654435761u);
+    splatRGB(px, hw, C.rgb * (bright * sc.z * SPLAT_K), rs);
+}
+#endif
