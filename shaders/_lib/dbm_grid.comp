@@ -1,0 +1,162 @@
+#define DBM_NS (DBM_NSX * DBM_NSY)
+layout(rgba32f, binding = 0) uniform image2D dbmCells;
+layout(rgba32f, binding = 1) uniform image2D dbmHdr;
+uniform sampler2D u_want;
+uniform int u_parity;
+
+const ivec2 DBM_NB[8] = ivec2[8](ivec2(1, 0), ivec2(1, 1), ivec2(0, 1), ivec2(-1, 1), ivec2(-1, 0), ivec2(-1, -1),
+                                 ivec2(0, -1), ivec2(1, -1));
+float dbmHash(vec4 p) {
+    p = fract(p * vec4(0.1031, 0.1030, 0.0973, 0.1099));
+    p += dot(p, p.wzxy + 33.33);
+    return fract((p.x + p.y) * (p.z + p.w));
+}
+ivec2 dbmOrigin(int s) { return ivec2((s % DBM_NSX) * DBM_SW, (s / DBM_NSX) * DBM_SH); }
+vec2 dbmCentre() { return 0.5 * vec2(DBM_SW, DBM_SH); }
+float dbmRT() { return 0.5 * float(min(DBM_SW, DBM_SH)) - 1.5; }
+bool dbmIsTarget(ivec2 l) {
+    float d = length(vec2(l) + 0.5 - dbmCentre());
+#if DBM_MODE == 0
+    return d >= dbmRT();
+#else
+    return length(vec2(l) + 0.5 - vec2(float(DBM_SW) - 3.0, 0.5 * float(DBM_SH))) <= 2.5;
+#endif
+}
+bool dbmIsSource(ivec2 l) {
+#if DBM_MODE == 0
+    return length(vec2(l) + 0.5 - dbmCentre()) <= DBM_R0;
+#else
+    return length(vec2(l) + 0.5 - vec2(1.5, 0.5 * float(DBM_SH))) <= 1.2;
+#endif
+}
+float dbmGuess(ivec2 l) {
+    vec2 q = vec2(l) + 0.5 - dbmCentre();
+#if DBM_MODE == 0
+    float d = max(length(q), DBM_R0);
+    return clamp(log(d / DBM_R0) / log(dbmRT() / DBM_R0), 0.0, 1.0);
+#else
+    float ax = (float(l.x) + 0.5) / float(DBM_SW);
+    return clamp(ax * exp(-pow(q.y / (0.35 * float(DBM_SH)), 2.0)), 0.0, 1.0);
+#endif
+}
+bool dbmDone(vec4 h0, vec4 h2) {
+    return h0.y > 0.5;
+}
+
+#if defined(K_DBM_RESET) || defined(K_DBM_RELAX) || defined(K_DBM_GROW)
+layout(local_size_x = 16, local_size_y = 16) in;
+void main() {
+    ivec2 g = ivec2(gl_GlobalInvocationID.xy);
+    if (g.x >= DBM_SW * DBM_NSX || g.y >= DBM_SH * DBM_NSY) return;
+    int s = (g.y / DBM_SH) * DBM_NSX + g.x / DBM_SW;
+    ivec2 o = dbmOrigin(s), l = g - o;
+    float want = texelFetch(u_want, ivec2(s, 0), 0).x;
+    vec4 h0 = imageLoad(dbmHdr, ivec2(s, 0));
+#ifdef K_DBM_RESET
+    if (h0.x == want) return;
+    bool src = dbmIsSource(l);
+    imageStore(dbmCells, g, src ? vec4(0.0, 1.0, 0.0, -1.0) : vec4(dbmIsTarget(l) ? 1.0 : dbmGuess(l), 0.0, 0.0, -1.0));
+#else
+    vec4 h1 = imageLoad(dbmHdr, ivec2(s, 1)), h2 = imageLoad(dbmHdr, ivec2(s, 2));
+    if (h0.x != want || dbmDone(h0, h2)) return;
+    vec4 c = imageLoad(dbmCells, g);
+#ifdef K_DBM_RELAX
+    if (((g.x + g.y) & 1) != u_parity || c.y > 0.5 || dbmIsTarget(l)) return;
+    float acc = 0.0;
+    for (int k = 0; k < 8; k += 2) {
+        ivec2 n = l + DBM_NB[k];
+        if (n.x < 0 || n.y < 0 || n.x >= DBM_SW || n.y >= DBM_SH) { acc += c.x; continue; }
+        vec4 cn = imageLoad(dbmCells, o + n);
+        acc += cn.y > 0.5 ? 0.0 : cn.x;
+    }
+    c.x = 0.25 * acc;
+    imageStore(dbmCells, g, c);
+#else
+    if (c.y > 0.5) return;
+    int cnt = 0, pick = -1;
+    float r2 = dbmHash(vec4(vec2(g), want, h1.x + 17.0));
+    for (int k = 0; k < 8; k++) {
+        ivec2 n = l + DBM_NB[k];
+        if (n.x < 0 || n.y < 0 || n.x >= DBM_SW || n.y >= DBM_SH) continue;
+        if (imageLoad(dbmCells, o + n).y > 0.5) { cnt++; if (pick < 0 || r2 * float(cnt) < 1.0) pick = k; }
+    }
+    if (cnt == 0) return;
+    float p = DBM_GROW_K * pow(clamp(c.x / max(h1.y, 1e-6), 0.0, 1.0), DBM_ETA);
+    if (dbmHash(vec4(vec2(g) * 1.37, want * 0.71, h1.x)) >= p) return;
+    imageStore(dbmCells, g, vec4(0.0, 1.0, h1.x + 1.0, float(pick)));
+    if (dbmIsTarget(l)) {
+        float idx = float(l.y * DBM_SW + l.x);
+        imageStore(dbmHdr, ivec2(s, 0), vec4(h0.x, 1.0, h0.z, h0.w));
+        imageStore(dbmHdr, ivec2(s, 1), vec4(h1.x, h1.y, idx, h1.w));
+    }
+#endif
+#endif
+}
+#endif
+
+#ifdef K_DBM_HDRGEN
+layout(local_size_x = 64) in;
+void main() {
+    int s = int(gl_GlobalInvocationID.x);
+    if (s >= DBM_NS) return;
+    float want = texelFetch(u_want, ivec2(s, 0), 0).x;
+    if (imageLoad(dbmHdr, ivec2(s, 0)).x == want) return;
+    imageStore(dbmHdr, ivec2(s, 0), vec4(want, 0.0, 0.0, 0.0));
+    imageStore(dbmHdr, ivec2(s, 1), vec4(0.0, 1.0, -1.0, 0.0));
+    imageStore(dbmHdr, ivec2(s, 2), vec4(0.0, -1.0, 0.0, 0.0));
+}
+#endif
+
+#ifdef K_DBM_STEP
+layout(local_size_x = 256) in;
+shared float shMax[256];
+void main() {
+    int s = int(gl_WorkGroupID.x), tid = int(gl_LocalInvocationID.x);
+    float want = texelFetch(u_want, ivec2(s, 0), 0).x;
+    vec4 h0 = imageLoad(dbmHdr, ivec2(s, 0)), h1 = imageLoad(dbmHdr, ivec2(s, 1)), h2 = imageLoad(dbmHdr, ivec2(s, 2));
+    if (h0.x != want || dbmDone(h0, h2)) return;
+    ivec2 o = dbmOrigin(s);
+    float m = 0.0;
+    for (int i = tid; i < DBM_SW * DBM_SH; i += 256) {
+        ivec2 l = ivec2(i % DBM_SW, i / DBM_SW);
+        vec4 c = imageLoad(dbmCells, o + l);
+        if (c.y > 0.5 || c.x <= m) continue;
+        for (int k = 0; k < 8; k++) {
+            ivec2 n = l + DBM_NB[k];
+            if (n.x < 0 || n.y < 0 || n.x >= DBM_SW || n.y >= DBM_SH) continue;
+            if (imageLoad(dbmCells, o + n).y > 0.5) { m = c.x; break; }
+        }
+    }
+    shMax[tid] = m;
+    barrier();
+    for (int w = 128; w > 0; w >>= 1) { if (tid < w) shMax[tid] = max(shMax[tid], shMax[tid + w]); barrier(); }
+    if (tid == 0) imageStore(dbmHdr, ivec2(s, 1), vec4(h1.x + 1.0, max(shMax[0], 1e-6), h1.z, h1.w));
+}
+#endif
+
+#ifdef K_DBM_TRACE
+layout(local_size_x = 64) in;
+void dbmTraceFrom(ivec2 o, float idx) {
+    if (idx < 0.0) return;
+    ivec2 l = ivec2(int(idx) % DBM_SW, int(idx) / DBM_SW);
+    for (int it = 0; it < DBM_SW * DBM_SH; it++) {
+        vec4 c = imageLoad(dbmCells, o + l);
+        if (c.y < 0.5) break;
+        c.y = 2.0;
+        imageStore(dbmCells, o + l, c);
+        if (c.w < 0.0) break;
+        l += DBM_NB[int(c.w)];
+        if (l.x < 0 || l.y < 0 || l.x >= DBM_SW || l.y >= DBM_SH) break;
+    }
+}
+void main() {
+    int s = int(gl_GlobalInvocationID.x);
+    if (s >= DBM_NS) return;
+    float want = texelFetch(u_want, ivec2(s, 0), 0).x;
+    vec4 h0 = imageLoad(dbmHdr, ivec2(s, 0)), h1 = imageLoad(dbmHdr, ivec2(s, 1)), h2 = imageLoad(dbmHdr, ivec2(s, 2));
+    if (h0.x != want || !dbmDone(h0, h2) || h0.w > 0.5) return;
+    ivec2 o = dbmOrigin(s);
+    dbmTraceFrom(o, h1.z);
+    imageStore(dbmHdr, ivec2(s, 0), vec4(h0.xyz, 1.0));
+}
+#endif

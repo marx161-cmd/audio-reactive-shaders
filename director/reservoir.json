@@ -1,0 +1,447 @@
+{
+  "version": 1,
+  "bodies": [
+    {
+      "id": "pulsar",
+      "type": "star",
+      "role": "hero",
+      "mood": "energetic",
+      "note": "needle-thin X-ray pulsar, twin polar jets and hard white glare",
+      "knobs": {"temp_k": 12000, "size": 0.0012, "glow": 1.0, "jets": 1.0, "ring": null, "shredded": false}
+    },
+    {
+      "id": "orange_dwarf",
+      "type": "star",
+      "role": "hero",
+      "mood": "any",
+      "note": "big soft orange dwarf, wide gentle corona",
+      "knobs": {"temp_k": 3800, "size": 0.09, "glow": 0.6, "jets": 0.0, "ring": null, "shredded": false}
+    },
+    {
+      "id": "victim",
+      "type": "star",
+      "role": "hero",
+      "mood": "energetic",
+      "note": "sun-like star booked for tidal disruption, debris stream and disk",
+      "knobs": {"temp_k": 5800, "size": 0.08, "glow": 0.8, "jets": 0.0, "ring": null, "shredded": true}
+    },
+    {
+      "id": "white_dwarf",
+      "type": "star",
+      "role": "filler",
+      "mood": "calm",
+      "note": "tiny blue-white white dwarf, dense pinpoint glare",
+      "knobs": {"temp_k": 14500, "size": 0.006, "glow": 1.45, "jets": 0.0, "ring": null, "shredded": false}
+    },
+    {
+      "id": "blue_supergiant",
+      "type": "star",
+      "role": "hero",
+      "mood": "energetic",
+      "note": "huge steel-blue supergiant, cold hard light",
+      "knobs": {"temp_k": 24000, "size": 0.085, "glow": 1.6, "jets": 0.0, "ring": null, "shredded": false}
+    },
+    {
+      "id": "red_giant",
+      "type": "star",
+      "role": "hero",
+      "mood": "calm",
+      "note": "swollen deep-red giant, slow smouldering halo",
+      "knobs": {"temp_k": 3000, "size": 0.09, "glow": 1.1, "jets": 0.0, "ring": null, "shredded": false}
+    },
+    {
+      "id": "ringed_beacon",
+      "type": "star",
+      "role": "hero",
+      "mood": "groove",
+      "note": "white star wearing a wide translucent ring of glowing dust",
+      "knobs": {"temp_k": 9200, "size": 0.03, "glow": 0.9, "jets": 0.0, "ring": {"inner": 1.4, "outer": 2.4, "opacity": 0.55}, "shredded": false}
+    },
+    {
+      "id": "blazar_jet",
+      "type": "star",
+      "role": "hero",
+      "mood": "energetic",
+      "note": "compact blazar, violent twin jets punching through the nebula",
+      "knobs": {"temp_k": 15500, "size": 0.002, "glow": 1.25, "jets": 1.5, "ring": null, "shredded": false}
+    },
+    {
+      "id": "crimson_ember",
+      "type": "star",
+      "role": "filler",
+      "mood": "calm",
+      "note": "small crimson ember of a star, almost no glare",
+      "knobs": {"temp_k": 2600, "size": 0.045, "glow": 0.35, "jets": 0.0, "ring": null, "shredded": false}
+    },
+    {
+      "id": "amber_pea",
+      "type": "star",
+      "role": "filler",
+      "mood": "groove",
+      "note": "warm amber pebble-star, compact tight glow",
+      "knobs": {"temp_k": 4300, "size": 0.012, "glow": 0.7, "jets": 0.0, "ring": null, "shredded": false}
+    },
+    {
+      "id": "solar_twin",
+      "type": "star",
+      "role": "filler",
+      "mood": "any",
+      "note": "plain yellow-white sun, honest daylight star",
+      "knobs": {"temp_k": 5800, "size": 0.03, "glow": 0.5, "jets": 0.0, "ring": null, "shredded": false}
+    },
+    {
+      "id": "pale_blue_pin",
+      "type": "star",
+      "role": "filler",
+      "mood": "energetic",
+      "note": "needle-thin blue pin with faint jets, distant cousin of the pulsar",
+      "knobs": {"temp_k": 19000, "size": 0.0015, "glow": 1.6, "jets": 1.2, "ring": null, "shredded": false}
+    },
+    {
+      "id": "cinder_dwarf",
+      "type": "star",
+      "role": "filler",
+      "mood": "calm",
+      "note": "dim red dwarf, barely lit coal against the nebula",
+      "knobs": {"temp_k": 2500, "size": 0.02, "glow": 0.22, "jets": 0.0, "ring": null, "shredded": false}
+    },
+    {
+      "id": "ice_ring_star",
+      "type": "star",
+      "role": "filler",
+      "mood": "calm",
+      "note": "small blue-white star inside a thin pale dust ring",
+      "knobs": {"temp_k": 13000, "size": 0.008, "glow": 1.2, "jets": 0.0, "ring": {"inner": 1.6, "outer": 3.0, "opacity": 0.35}, "shredded": false}
+    },
+    {
+      "id": "shredded_blue",
+      "type": "star",
+      "role": "hero",
+      "mood": "energetic",
+      "note": "hot blue star midway through being pulled apart at the hole",
+      "knobs": {"temp_k": 16000, "size": 0.06, "glow": 0.7, "jets": 0.0, "ring": null, "shredded": true}
+    },
+
+    {
+      "id": "pg",
+      "type": "planet",
+      "role": "filler",
+      "mood": "any",
+      "note": "reference banded giant with four moons",
+      "knobs": {"size": 0.07, "texture": "gas_bands", "hue": 0.0, "tint": [1.0, 1.0, 1.0], "bands": 1.0, "moons": 4, "moon_size": 0.01, "ring": null}
+    },
+    {
+      "id": "dga",
+      "type": "planet",
+      "role": "hero",
+      "mood": "calm",
+      "note": "reference ringed giant, pale broad ring tilted twenty degrees",
+      "knobs": {"size": 0.08, "texture": "gas_bands", "hue": 0.0, "tint": [1.0, 1.0, 1.0], "bands": 1.0, "moons": 2, "moon_size": 0.01, "ring": {"inner": 1.5, "outer": 1.8, "opacity": 0.8, "tilt_deg": 20}}
+    },
+    {
+      "id": "gg3",
+      "type": "planet",
+      "role": "filler",
+      "mood": "groove",
+      "note": "reference cool Neptune-blue banded giant",
+      "knobs": {"size": 0.075, "texture": "gas_bands", "hue": 0.52, "tint": [0.8, 0.98, 1.25], "bands": 0.7, "moons": 0, "moon_size": 0.0, "ring": null}
+    },
+    {
+      "id": "lava",
+      "type": "planet",
+      "role": "filler",
+      "mood": "energetic",
+      "note": "reference small lava world, glowing cracks on dark crust",
+      "knobs": {"size": 0.02, "texture": "lava", "hue": 0.0, "tint": [1.0, 1.0, 1.0], "bands": 0.0, "moons": 0, "moon_size": 0.0, "ring": null}
+    },
+    {
+      "id": "neptune_deep",
+      "type": "planet",
+      "role": "filler",
+      "mood": "calm",
+      "note": "deep indigo gas world with one small bright moon",
+      "knobs": {"size": 0.05, "texture": "gas_bands", "hue": 0.6, "tint": [0.82, 0.88, 1.32], "bands": 0.5, "moons": 1, "moon_size": 0.006, "ring": null}
+    },
+    {
+      "id": "ice_giant_pale",
+      "type": "planet",
+      "role": "filler",
+      "mood": "calm",
+      "note": "pale seafoam ice giant, faint banding, two pebble moons",
+      "knobs": {"size": 0.045, "texture": "gas_bands", "hue": 0.45, "tint": [0.95, 1.18, 1.25], "bands": 0.35, "moons": 2, "moon_size": 0.005, "ring": null}
+    },
+    {
+      "id": "ochre_banded",
+      "type": "planet",
+      "role": "filler",
+      "mood": "groove",
+      "note": "ochre giant with hard sharp banding, no moons",
+      "knobs": {"size": 0.06, "texture": "gas_bands", "hue": 0.1, "tint": [1.28, 1.06, 0.88], "bands": 0.9, "moons": 0, "moon_size": 0.0, "ring": null}
+    },
+    {
+      "id": "storm_giant",
+      "type": "planet",
+      "role": "filler",
+      "mood": "energetic",
+      "note": "rust-orange storm giant, three moons strung behind it",
+      "knobs": {"size": 0.065, "texture": "gas_bands", "hue": 0.02, "tint": [1.32, 0.92, 0.78], "bands": 0.8, "moons": 3, "moon_size": 0.008, "ring": null}
+    },
+    {
+      "id": "ringed_ice_king",
+      "type": "planet",
+      "role": "hero",
+      "mood": "calm",
+      "note": "huge pale-blue ringed giant, wide bright ring, one distant moon",
+      "knobs": {"size": 0.08, "texture": "gas_bands", "hue": 0.55, "tint": [0.9, 1.05, 1.28], "bands": 0.45, "moons": 1, "moon_size": 0.007, "ring": {"inner": 2.0, "outer": 2.6, "opacity": 0.45, "tilt_deg": 32}}
+    },
+    {
+      "id": "halo_ring_gas",
+      "type": "planet",
+      "role": "filler",
+      "mood": "calm",
+      "note": "cream gas world inside a faint wide dust halo, nearly edge-on",
+      "knobs": {"size": 0.055, "texture": "gas_bands", "hue": 0.12, "tint": [1.22, 1.05, 0.92], "bands": 0.6, "moons": 0, "moon_size": 0.0, "ring": {"inner": 1.3, "outer": 2.2, "opacity": 0.25, "tilt_deg": 38}}
+    },
+    {
+      "id": "gas_dwarf_teal",
+      "type": "planet",
+      "role": "filler",
+      "mood": "groove",
+      "note": "small teal gas dwarf, soft bands",
+      "knobs": {"size": 0.03, "texture": "gas_bands", "hue": 0.4, "tint": [0.86, 1.16, 1.16], "bands": 0.5, "moons": 0, "moon_size": 0.0, "ring": null}
+    },
+    {
+      "id": "gas_dwarf_rose",
+      "type": "planet",
+      "role": "filler",
+      "mood": "calm",
+      "note": "rose-pink gas dwarf, gentle contrast",
+      "knobs": {"size": 0.035, "texture": "gas_bands", "hue": 0.9, "tint": [1.3, 0.95, 1.12], "bands": 0.65, "moons": 0, "moon_size": 0.0, "ring": null}
+    },
+    {
+      "id": "striped_tiny",
+      "type": "planet",
+      "role": "filler",
+      "mood": "groove",
+      "note": "tiny candy-striped gas ball with a single speck of a moon",
+      "knobs": {"size": 0.025, "texture": "gas_bands", "hue": 0.15, "tint": [1.2, 1.1, 0.9], "bands": 1.0, "moons": 1, "moon_size": 0.004, "ring": null}
+    },
+    {
+      "id": "banded_hero",
+      "type": "planet",
+      "role": "hero",
+      "mood": "calm",
+      "note": "showpiece banded giant at close range, four moons and hard bands",
+      "knobs": {"size": 0.078, "texture": "gas_bands", "hue": 0.0, "tint": [1.15, 1.02, 0.9], "bands": 0.95, "moons": 4, "moon_size": 0.012, "ring": null}
+    },
+    {
+      "id": "moon_grey",
+      "type": "planet",
+      "role": "filler",
+      "mood": "any",
+      "note": "plain grey cratered moon-world, neutral and quiet",
+      "knobs": {"size": 0.028, "texture": "rock", "hue": 0.0, "tint": [1.0, 1.0, 1.0], "bands": 0.0, "moons": 0, "moon_size": 0.0, "ring": null}
+    },
+    {
+      "id": "rust_world",
+      "type": "planet",
+      "role": "filler",
+      "mood": "groove",
+      "note": "rust-red desert rock with two small companions",
+      "knobs": {"size": 0.035, "texture": "rock", "hue": 0.05, "tint": [1.3, 0.9, 0.68], "bands": 0.0, "moons": 2, "moon_size": 0.006, "ring": null}
+    },
+    {
+      "id": "icy_pebble",
+      "type": "planet",
+      "role": "filler",
+      "mood": "calm",
+      "note": "icy blue-white pebble, high albedo, no moons",
+      "knobs": {"size": 0.022, "texture": "rock", "hue": 0.55, "tint": [0.9, 1.1, 1.3], "bands": 0.0, "moons": 0, "moon_size": 0.0, "ring": null}
+    },
+    {
+      "id": "basalt_ring",
+      "type": "planet",
+      "role": "filler",
+      "mood": "groove",
+      "note": "dark basalt world with a bright narrow ring, near flat-on",
+      "knobs": {"size": 0.04, "texture": "rock", "hue": 0.7, "tint": [0.8, 0.86, 1.02], "bands": 0.0, "moons": 0, "moon_size": 0.0, "ring": {"inner": 1.5, "outer": 2.0, "opacity": 0.5, "tilt_deg": 10}}
+    },
+    {
+      "id": "cratered_hero",
+      "type": "planet",
+      "role": "hero",
+      "mood": "calm",
+      "note": "big pale cratered world, three moons drifting past, slow reveal",
+      "knobs": {"size": 0.055, "texture": "rock", "hue": 0.0, "tint": [1.05, 1.0, 0.95], "bands": 0.0, "moons": 3, "moon_size": 0.01, "ring": null}
+    },
+    {
+      "id": "dark_silicate",
+      "type": "planet",
+      "role": "filler",
+      "mood": "calm",
+      "note": "dim slate-grey rock, almost lost in shadow",
+      "knobs": {"size": 0.03, "texture": "rock", "hue": 0.62, "tint": [0.72, 0.72, 0.78], "bands": 0.0, "moons": 0, "moon_size": 0.0, "ring": null}
+    },
+    {
+      "id": "tiny_rock_pair",
+      "type": "planet",
+      "role": "filler",
+      "mood": "any",
+      "note": "small dusty rock with two barely-there moonlets",
+      "knobs": {"size": 0.024, "texture": "rock", "hue": 0.2, "tint": [1.12, 1.04, 0.96], "bands": 0.0, "moons": 2, "moon_size": 0.004, "ring": null}
+    },
+    {
+      "id": "ocean_rock",
+      "type": "planet",
+      "role": "filler",
+      "mood": "calm",
+      "note": "cool blue-green rock world, one close moon",
+      "knobs": {"size": 0.042, "texture": "rock", "hue": 0.45, "tint": [0.8, 1.0, 1.25], "bands": 0.0, "moons": 1, "moon_size": 0.006, "ring": null}
+    },
+    {
+      "id": "desert_ring_rock",
+      "type": "planet",
+      "role": "filler",
+      "mood": "groove",
+      "note": "sand-gold rock ringed by warm dust, thirty degree tilt",
+      "knobs": {"size": 0.036, "texture": "rock", "hue": 0.08, "tint": [1.28, 1.12, 0.85], "bands": 0.0, "moons": 0, "moon_size": 0.0, "ring": {"inner": 1.6, "outer": 2.3, "opacity": 0.4, "tilt_deg": 30}}
+    },
+    {
+      "id": "gas_big_red",
+      "type": "planet",
+      "role": "filler",
+      "mood": "energetic",
+      "note": "broad crimson banded giant, two heavy moons",
+      "knobs": {"size": 0.072, "texture": "gas_bands", "hue": 0.95, "tint": [1.32, 0.9, 0.85], "bands": 0.75, "moons": 2, "moon_size": 0.009, "ring": null}
+    },
+    {
+      "id": "ringed_gas_dark",
+      "type": "planet",
+      "role": "hero",
+      "mood": "groove",
+      "note": "dark blue-green giant with a thick shadowed ring and one moon",
+      "knobs": {"size": 0.062, "texture": "gas_bands", "hue": 0.68, "tint": [0.8, 0.92, 1.15], "bands": 0.55, "moons": 1, "moon_size": 0.006, "ring": {"inner": 1.7, "outer": 2.5, "opacity": 0.55, "tilt_deg": 22}}
+    },
+    {
+      "id": "lava_forge",
+      "type": "planet",
+      "role": "hero",
+      "mood": "energetic",
+      "note": "large lava world, rivers of light across black crust",
+      "knobs": {"size": 0.045, "texture": "lava", "hue": 0.0, "tint": [1.3, 0.9, 0.8], "bands": 0.0, "moons": 0, "moon_size": 0.0, "ring": null}
+    },
+    {
+      "id": "lava_moon",
+      "type": "planet",
+      "role": "filler",
+      "mood": "energetic",
+      "note": "small molten world trailed by one dark moon",
+      "knobs": {"size": 0.03, "texture": "lava", "hue": 0.02, "tint": [1.1, 0.85, 0.8], "bands": 0.0, "moons": 1, "moon_size": 0.005, "ring": null}
+    },
+    {
+      "id": "lava_ring",
+      "type": "planet",
+      "role": "filler",
+      "mood": "energetic",
+      "note": "glowing lava planet inside a thin hot ring",
+      "knobs": {"size": 0.05, "texture": "lava", "hue": 0.03, "tint": [1.2, 0.85, 0.78], "bands": 0.0, "moons": 0, "moon_size": 0.0, "ring": {"inner": 1.4, "outer": 1.9, "opacity": 0.35, "tilt_deg": 15}}
+    },
+    {
+      "id": "lava_small_dark",
+      "type": "planet",
+      "role": "filler",
+      "mood": "calm",
+      "note": "small cooling lava world, only a few cracks still lit",
+      "knobs": {"size": 0.02, "texture": "lava", "hue": 0.0, "tint": [0.9, 0.8, 0.75], "bands": 0.0, "moons": 0, "moon_size": 0.0, "ring": null}
+    },
+    {
+      "id": "lava_twins",
+      "type": "planet",
+      "role": "filler",
+      "mood": "groove",
+      "note": "bright molten world with two small moons catching its glow",
+      "knobs": {"size": 0.026, "texture": "lava", "hue": 0.98, "tint": [1.35, 0.95, 0.85], "bands": 0.0, "moons": 2, "moon_size": 0.005, "ring": null}
+    },
+
+    {
+      "id": "great_comet",
+      "type": "comet",
+      "role": "hero",
+      "mood": "energetic",
+      "note": "great comet, three-unit ion tail sweeping past",
+      "knobs": {"size": 0.012, "tail_len": 3.0, "tail_temp_k": 9000, "brightness": 1.6}
+    },
+    {
+      "id": "blue_ion",
+      "type": "comet",
+      "role": "hero",
+      "mood": "calm",
+      "note": "long straight blue-white ion tail, cold electric streak",
+      "knobs": {"size": 0.008, "tail_len": 2.4, "tail_temp_k": 16000, "brightness": 1.3}
+    },
+    {
+      "id": "dust_amber",
+      "type": "comet",
+      "role": "filler",
+      "mood": "groove",
+      "note": "warm amber dust tail, curved and soft",
+      "knobs": {"size": 0.01, "tail_len": 1.8, "tail_temp_k": 5000, "brightness": 0.9}
+    },
+    {
+      "id": "tiny_fast",
+      "type": "comet",
+      "role": "filler",
+      "mood": "energetic",
+      "note": "small fast mover with a tight neutral tail",
+      "knobs": {"size": 0.004, "tail_len": 1.2, "tail_temp_k": 12000, "brightness": 0.7}
+    },
+    {
+      "id": "snowball",
+      "type": "comet",
+      "role": "filler",
+      "mood": "calm",
+      "note": "dim short-tailed snowball, understated",
+      "knobs": {"size": 0.006, "tail_len": 0.7, "tail_temp_k": 7000, "brightness": 0.6}
+    },
+    {
+      "id": "ember_comet",
+      "type": "comet",
+      "role": "filler",
+      "mood": "energetic",
+      "note": "red-orange dust comet, ember streak across the dark",
+      "knobs": {"size": 0.009, "tail_len": 1.5, "tail_temp_k": 4200, "brightness": 1.0}
+    },
+    {
+      "id": "needle_comet",
+      "type": "comet",
+      "role": "filler",
+      "mood": "any",
+      "note": "near-invisible nucleus with an extremely long violet tail",
+      "knobs": {"size": 0.003, "tail_len": 3.0, "tail_temp_k": 18000, "brightness": 1.4}
+    },
+    {
+      "id": "slow_lantern",
+      "type": "comet",
+      "role": "filler",
+      "mood": "groove",
+      "note": "slow warm lantern-comet, short glowing trail",
+      "knobs": {"size": 0.007, "tail_len": 0.9, "tail_temp_k": 6500, "brightness": 0.8}
+    },
+    {
+      "id": "crimson_duster",
+      "type": "comet",
+      "role": "filler",
+      "mood": "groove",
+      "note": "fat dusty comet, deep crimson tail fading to rust",
+      "knobs": {"size": 0.011, "tail_len": 2.0, "tail_temp_k": 5200, "brightness": 1.1}
+    },
+    {
+      "id": "pale_ghost",
+      "type": "comet",
+      "role": "filler",
+      "mood": "calm",
+      "note": "ghost-pale wisp with a very long faint tail",
+      "knobs": {"size": 0.005, "tail_len": 2.6, "tail_temp_k": 19500, "brightness": 0.55}
+    }
+  ]
+}

@@ -1,0 +1,474 @@
+#define C_S        0.0015
+#define NU         4.0e-6
+#define TAU_RELAX  300.0
+#define TAU_DRAIN  60.0
+#define SIG_FLOOR  0.02
+#define SIG_MAX    2.5
+#define SINK_HILL  0.6
+#define V_MAX      0.03
+#define EMPTY_DAMP 0.85
+
+float hash11(float p) { p = fract(p * 0.1031); p *= p + 33.33; p *= p + p; return fract(p); }
+float noise1(float x) { float i = floor(x), f = fract(x); f = f * f * (3.0 - 2.0 * f); return mix(hash11(i), hash11(i + 1.0), f); }
+
+float sigma0(float r) {
+    float s = smoothstep(0.320, 0.332, r) * (1.0 - smoothstep(2.860, 2.875, r));
+    float b = 0.55 * noise1(r * 28.0) + 0.30 * noise1(r * 95.0 + 7.0) + 0.15 * noise1(r * 310.0 + 3.0);
+    s *= mix(0.12, 1.15, smoothstep(0.36, 0.62, b));
+    s *= 0.70 + 0.30 * smoothstep(0.33, 1.20, r);
+    s *= smoothstep(0.040, 0.055, abs(r - 1.9));
+    return s;
+}
+
+#ifdef K_INIT
+layout(local_size_x = 16, local_size_y = 16) in;
+layout(rgba32f, binding = 0) uniform writeonly image2D outImg;
+void main() {
+    ivec2 c = ivec2(gl_GlobalInvocationID.xy);
+    if (c.x >= NT || c.y >= NR) return;
+    imageStore(outImg, c, vec4(sigma0(rowR(float(c.y))), 0.0, 0.0, 0.0));
+}
+#endif
+
+#ifdef K_PROF
+layout(local_size_x = 64) in;
+layout(rgba32f, binding = 0) uniform writeonly image2D outImg;
+uniform sampler2D u_field;
+uniform sampler2D u_phase;
+#define PROF_SEC 32
+void main() {
+    int j = int(gl_GlobalInvocationID.x);
+    if (j >= NR) return;
+    float sec[PROF_SEC];
+    for (int k = 0; k < PROF_SEC; k++) sec[k] = 0.0;
+    int per = NT / PROF_SEC;
+    for (int i = 0; i < NT; i++) { float v = texelFetch(u_field, ivec2(i, j), 0).x; sec[i / per] += (isnan(v) || isinf(v)) ? 0.0 : v; }
+    float sum = 0.0, mn = 1e30; int km = 0;
+    for (int k = 0; k < PROF_SEC; k++) { sum += sec[k]; if (sec[k] < mn) { mn = sec[k]; km = k; } }
+    float th = mod((float(km) + 0.5) * float(per) * DTH + texelFetch(u_phase, ivec2(j, 0), 0).x, 6.28318530718);
+    imageStore(outImg, ivec2(j, 0), vec4(sum / float(NT), sigma0(rowR(float(j))), th, mn / float(per)));
+}
+#endif
+
+#if defined(K_ADVECT) || defined(K_FORCE)
+uniform sampler2D u_src;
+uniform sampler2D u_phase;
+uniform float u_h;
+
+vec4 fetchF(int j, int k) { return texelFetch(u_src, ivec2((k % NT + NT) % NT, clamp(j, 0, NR - 1)), 0); }
+float phiRow(int j, int ch) { vec4 p = texelFetch(u_phase, ivec2(clamp(j, 0, NR - 1), 0), 0); return ch == 0 ? p.x : p.y; }
+
+vec4 sampleF(float r, float th, int ch) {
+    float jf = clamp((r - R_IN) / DR - 0.5, 0.0, float(NR - 1));
+    int j0 = int(floor(jf));
+    float fj = jf - float(j0);
+    vec4 res = vec4(0.0);
+    for (int q = 0; q < 2; q++) {
+        int j = min(j0 + q, NR - 1);
+        float rel = mod(th - phiRow(j, ch), 6.28318530718);
+        float kf = rel / DTH - 0.5;
+        float k0 = floor(kf);
+        float fk = kf - k0;
+        vec4 v = mix(fetchF(j, int(k0)), fetchF(j, int(k0) + 1), fk);
+        res += v * (q == 0 ? 1.0 - fj : fj);
+    }
+    return res;
+}
+#endif
+
+#ifdef K_ADVECT
+layout(local_size_x = 16, local_size_y = 16) in;
+layout(rgba32f, binding = 0) uniform writeonly image2D outImg;
+void main() {
+    ivec2 c = ivec2(gl_GlobalInvocationID.xy);
+    if (c.x >= NT || c.y >= NR) return;
+    float r = rowR(float(c.y));
+    float th = (float(c.x) + 0.5) * DTH + phiRow(c.y, 0);
+    vec4 F = fetchF(c.y, c.x);
+    float rm = clamp(r - 0.5 * F.y * u_h, R_IN, R_OUT);
+    float rd = clamp(r - F.y * u_h, R_IN, R_OUT);
+    float thd = th - (omegaK(rm) + F.z / rm) * u_h;
+    imageStore(outImg, c, sampleF(rd, thd, 1));
+}
+#endif
+
+#ifdef K_FORCE
+uniform float iTime;
+#define CAM_D      7.237
+#define CAM_EL     0.7854
+#define CAM_ORBIT  0.0
+#define HIDE_GAIN 6.0
+#define SEEN_GAIN 0.15
+float u_hidden(vec3 P) {
+    float az = CAM_ORBIT * iTime;
+    vec3 u_camPos = CAM_D * vec3(cos(CAM_EL) * sin(az), sin(CAM_EL), -cos(CAM_EL) * cos(az));
+    vec3 d = P - u_camPos;
+    float L = length(d); d /= L;
+    float b = dot(-u_camPos, d);
+    float cc = dot(u_camPos, u_camPos) - b * b;
+    bool behind = cc < DW_R * DW_R && b > 0.0 && b < L;
+    return behind ? HIDE_GAIN : SEEN_GAIN;
+}
+layout(local_size_x = 16, local_size_y = 16) in;
+layout(rgba32f, binding = 0) uniform writeonly image2D outImg;
+uniform sampler2D u_moons;
+uniform vec4 u_splat;
+uniform int u_nMoons;
+uniform vec4 u_rbHole;
+uniform float u_rbRefill;
+uniform sampler2D u_rbPuff;
+void main() {
+    ivec2 c = ivec2(gl_GlobalInvocationID.xy);
+    if (c.x >= NT || c.y >= NR) return;
+    float r = rowR(float(c.y));
+    float th = (float(c.x) + 0.5) * DTH + phiRow(c.y, 0);
+    if (c.y == 0 || c.y == NR - 1) { imageStore(outImg, c, vec4(sigma0(r) * u_rbRefill, 0.0, 0.0, 0.0)); return; }
+    vec4 F  = fetchF(c.y, c.x);
+    vec4 Fe = fetchF(c.y, c.x + 1), Fw = fetchF(c.y, c.x - 1);
+    vec4 Fn = sampleF(r + DR, th, 0), Fs = sampleF(r - DR, th, 0);
+    float S = F.x, ur = F.y, vp = F.z;
+    float Se = max(S, SIG_FLOOR);
+    float rdth = r * DTH;
+    float dSdr = (Fn.x - Fs.x) / (2.0 * DR), dSdt = (Fe.x - Fw.x) / (2.0 * rdth);
+    float durdr = (Fn.y - Fs.y) / (2.0 * DR), dvdt = (Fe.z - Fw.z) / (2.0 * rdth);
+    float lapUr = (Fn.y - 2.0 * ur + Fs.y) / (DR * DR) + (Fe.y - 2.0 * ur + Fw.y) / (rdth * rdth);
+    float lapV  = (Fn.z - 2.0 * vp + Fs.z) / (DR * DR) + (Fe.z - 2.0 * vp + Fw.z) / (rdth * rdth);
+    vec2 er = vec2(cos(th), sin(th)), et = vec2(-er.y, er.x);
+    vec3 P = vec3(r * er.x, 0.0, r * er.y);
+    float ar = 0.0, at = 0.0, sink = 1.0;
+    for (int i = 0; i < u_nMoons; i++) {
+        vec4 m0 = texelFetch(u_moons, ivec2(i, 0), 0), m1 = texelFetch(u_moons, ivec2(i, 1), 0);
+        vec3 d = m0.xyz - P;
+        float rH = length(m0.xyz) * pow(m1.x / 3.0, 1.0 / 3.0);
+        float sR = m1.z > 0.0 ? m1.z : SINK_HILL * rH;
+        sink *= smoothstep(0.5, 1.0, length(d) / sR);
+        float q = dot(d, d) + m1.y * m1.y;
+        vec3 a = m1.x * d / (q * sqrt(q));
+        ar += dot(a.xz, er); at += dot(a.xz, et);
+    }
+    if (u_splat.w > 0.5) {
+        vec2 sd = P.xz - u_splat.xy;
+        float sw = exp(-dot(sd, sd) / (0.08 * 0.08));
+        vec2 sk = normalize(sd + vec2(1e-6)) * u_splat.z * sw;
+        ar += dot(sk, er); at += dot(sk, et);
+    }
+    float vK = pow(r, -0.5);
+    float h = u_h;
+    float nur = ur + h * ((2.0 * vK * vp + vp * vp) / r - C_S * C_S * dSdr / Se + ar + NU * lapUr);
+    float nvp = vp + h * (-ur * vK / (2.0 * r) - ur * vp / r - C_S * C_S * dSdt / Se + at + NU * lapV);
+    float div = durdr + ur / r + dvdt;
+    float nS = S * exp(-clamp(div * h, -0.5, 0.5)) + (sigma0(r) - S) * h / TAU_RELAX * u_hidden(P) * u_rbRefill
+             + min(sigma0(r) - S, 0.0) * h / TAU_DRAIN;
+    for (int i = 0; i < 16; i++) {
+        vec4 pf = texelFetch(u_rbPuff, ivec2(i, 0), 0);
+        if (pf.z <= 0.0) continue;
+        float da = mod(th - pf.y + 3.14159265, 6.28318530718) - 3.14159265;
+        nS += h * pf.z * exp(-pow((r - pf.x) / 0.10, 2.0) - pow(da / 0.35, 2.0) - pow(pf.w / 0.25, 2.0));
+    }
+    if (u_rbHole.w > 0.0) {
+        vec3 dh = P - u_rbHole.xyz;
+        nS *= exp(-h * u_rbHole.w * clamp(16.0 / dot(dh, dh), 0.3, 3.0));
+    }
+    nS = min(nS * mix(0.9, 1.0, sink), SIG_MAX);
+    if (nS < SIG_FLOOR) { nur *= EMPTY_DAMP; nvp *= EMPTY_DAMP; }
+    nur = clamp(nur, -V_MAX, V_MAX); nvp = clamp(nvp, -V_MAX, V_MAX);
+    vec4 o = vec4(max(nS, 0.0), nur, nvp, 0.0);
+    if (any(isnan(o)) || any(isinf(o))) o = vec4(sigma0(r), 0.0, 0.0, 0.0);
+    imageStore(outImg, c, o);
+}
+#endif
+
+#ifdef K_DARK
+layout(local_size_x = 64) in;
+layout(rgba32f, binding = 0) uniform readonly image2D candImg;
+layout(rgba32f, binding = 1) uniform writeonly image2D lumaImg;
+uniform int u_nCand;
+uniform float iTime;
+#define CF_SPIN 0.012
+vec3 dwRotY(vec3 p, float a) { float c = cos(a), s = sin(a); return vec3(c * p.x + s * p.z, p.y, -s * p.x + c * p.z); }
+void main() {
+    int i = int(gl_GlobalInvocationID.x);
+    if (i == u_nCand) imageStore(lumaImg, ivec2(i, 0), vec4(iTime));
+    if (i >= u_nCand) return;
+    vec3 m = dwRotY(imageLoad(candImg, ivec2(i, 0)).xyz, CF_SPIN * iTime);
+    imageStore(lumaImg, ivec2(i, 0), vec4(m, dwarfLuma(m, iTime)));
+}
+#endif
+
+#ifdef K_NOTES
+layout(local_size_x = 12) in;
+layout(rgba32f, binding = 0) uniform image2D noteImg;
+layout(rgba32f, binding = 1) uniform image2D spokeImg;
+uniform sampler2D stems;
+uniform float iTime;
+uniform float u_dt;
+uniform float u_kick, u_drum_mid, u_drum_high;
+uniform float u_ms_change, u_ms_drop_in, u_ms_source;
+uniform float u_pad_moon_gate;
+uniform float u_pad_big_gate;
+uniform float u_pad_moon_fire;
+uniform float u_pad_big_fire;
+#define NT_LEVEL_T 0.08
+#define DR_ON      0.45
+#define DR_OFF     0.20
+#define MOON_REF   0.25
+#define BIG_REF    1.5
+#define BIG_LIVE_S 40.0
+#define BIG_LIVE_K 0.80
+#define N_SPOKE    32
+float nHash(float n) { return fract(sin(n * 78.233 + 1.31) * 43758.5453); }
+void fireMoon(int pc, float strength) {
+    vec4 s = imageLoad(noteImg, ivec2(pc, 0)), c = imageLoad(noteImg, ivec2(pc, 1));
+    s.z = iTime; s.w = strength; c.x += 1.0;
+    imageStore(noteImg, ivec2(pc, 0), s); imageStore(noteImg, ivec2(pc, 1), c);
+}
+void fireBig(int pc, float strength) {
+    vec4 p0 = imageLoad(noteImg, ivec2(12, 0)), p1 = imageLoad(noteImg, ivec2(12, 1));
+    if (iTime - p0.z < BIG_REF) return;
+    imageStore(noteImg, ivec2(12, 0), vec4(0.0, 0.0, iTime, strength));
+    imageStore(noteImg, ivec2(12, 1), vec4(p1.x + 1.0, float(pc), 0.0, 0.0));
+}
+void main() {
+    int p = int(gl_GlobalInvocationID.x);
+    float L = 0.0;
+    for (int b = (p + 3) % 12; b < 108; b += 12) L = max(L, texelFetch(stems, ivec2(b, 2), 0).r);
+    vec4 s = imageLoad(noteImg, ivec2(p, 0));
+    if (any(isnan(s))) s = vec4(0.0, 0.0, -100.0, 0.0);
+    s.x += (L - s.x) * (1.0 - exp(-u_dt / NT_LEVEL_T));
+    imageStore(noteImg, ivec2(p, 0), s);
+    memoryBarrierImage(); barrier();
+    if (p != 0) return;
+    int first = -1, second = -1; float l1 = 0.02, l2 = 0.02;
+    for (int k = 0; k < 12; k++) {
+        vec4 sk = imageLoad(noteImg, ivec2(k, 0));
+        if (iTime - sk.z < MOON_REF) continue;
+        if (sk.x > l1) { second = first; l2 = l1; first = k; l1 = sk.x; }
+        else if (sk.x > l2) { second = k; l2 = sk.x; }
+    }
+    vec4 st = imageLoad(noteImg, ivec2(0, 2)), st2 = imageLoad(noteImg, ivec2(1, 2));
+    if (any(isnan(st))) st = vec4(1.0, 1.0, 1.0, u_ms_change);
+    if (any(isnan(st2))) st2 = vec4(-1.0, 0.0, 0.0, 0.0);
+    if (u_pad_moon_fire > 0.5) {
+        int k = first;
+        if (k < 0) {
+            float bl = -1.0;
+            for (int j = 0; j < 12; j++) {
+                float lj = imageLoad(noteImg, ivec2(j, 0)).x;
+                if (lj > bl) { bl = lj; k = j; }
+            }
+            if (bl < 0.02) { k = int(mod(st2.z, 12.0)); st2.z += 1.0; }
+        }
+        if (k >= 0) fireMoon(k, 0.9);
+    }
+    if (u_pad_big_fire > 0.5) fireBig(first >= 0 ? first : 0, 1.0);
+    if (st.x > 0.5 && u_kick > DR_ON) {
+        st.x = 0.0;
+        if (u_pad_moon_gate > 0.5 && first >= 0) fireMoon(first, clamp(u_kick, 0.5, 1.0));
+        vec4 p0 = imageLoad(noteImg, ivec2(12, 0));
+        if (u_pad_big_gate > 0.5 && u_ms_source < 0.5 && u_kick > BIG_LIVE_K && iTime - p0.z > BIG_LIVE_S && first >= 0) fireBig(first, 1.0);
+    } else if (u_kick < DR_OFF) st.x = 1.0;
+    if (st.y > 0.5 && u_drum_mid > DR_ON) {
+        st.y = 0.0;
+        int k = second >= 0 ? second : first;
+        if (u_pad_moon_gate > 0.5 && k >= 0 && iTime - imageLoad(noteImg, ivec2(k, 0)).z >= MOON_REF) fireMoon(k, clamp(u_drum_mid, 0.5, 1.0));
+    } else if (u_drum_mid < DR_OFF) st.y = 1.0;
+    if (st.z > 0.5 && u_drum_high > DR_ON) {
+        st.z = 0.0;
+        float n = st2.y; st2.y += 1.0;
+        int slot = int(mod(n, float(N_SPOKE)));
+        float camAng = 0.006 * iTime - 1.5707963;
+        float th = camAng + 6.2831853 * (0.1 + 0.8 * nHash(n * 3.1 + iTime));
+        float rc = 0.35 + 1.85 * nHash(n * 7.7 + 0.3);
+        imageStore(spokeImg, ivec2(slot, 0), vec4(rc, th, iTime, clamp(u_drum_high, 0.5, 1.0)));
+        imageStore(spokeImg, ivec2(slot, 1), vec4(0.12 + 0.22 * nHash(n * 5.3), 0.008 + 0.014 * nHash(n * 2.9), 0.0, 0.0));
+    } else if (u_drum_high < DR_OFF) st.z = 1.0;
+    if (u_ms_change != st.w) { st.w = u_ms_change; if (u_pad_big_gate > 0.5 && first >= 0) fireBig(first, 1.0); }
+    if (u_pad_big_gate > 0.5 && u_ms_source > 0.5 && st2.x > 0.0 && st2.x < 1.0 && (u_ms_drop_in <= 0.02 || u_ms_drop_in > st2.x + 1.0))
+        fireBig(first >= 0 ? first : 0, 1.0);
+    st2.x = u_ms_drop_in;
+    imageStore(noteImg, ivec2(0, 2), st);
+    imageStore(noteImg, ivec2(1, 2), st2);
+}
+#endif
+
+#ifdef K_WANT
+layout(local_size_x = 32) in;
+layout(rgba32f, binding = 0) uniform writeonly image2D sparkWant;
+layout(rgba32f, binding = 1) uniform writeonly image2D tubeWant;
+uniform sampler2D u_notes;
+void main() {
+    int i = int(gl_GlobalInvocationID.x);
+    if (i < 24) {
+        float fc = texelFetch(u_notes, ivec2(i / 2, 1), 0).x;
+        float g = (i % 2) == int(mod(fc, 2.0)) ? fc : fc + 1.0;
+        imageStore(sparkWant, ivec2(i, 0), vec4(g, 1.0, 0.0, 0.0));
+    } else if (i < 28) {
+        int j = i - 24;
+        float pcn = texelFetch(u_notes, ivec2(12, 1), 0).x;
+        float g = (j / 2) == int(mod(pcn, 2.0)) ? pcn : pcn + 1.0;
+        imageStore(tubeWant, ivec2(j, 0), vec4(g, 1.0, 0.0, 0.0));
+    }
+}
+#endif
+
+#ifdef K_CLOCK
+layout(local_size_x = 1) in;
+layout(rgba32f, binding = 0) uniform writeonly image2D clkImg;
+uniform float iTime, u_beat_count, u_tbeat, u_beat_conf, u_ms_source, u_ms_drop_in, u_ms_bar_phase;
+void main() {
+    imageStore(clkImg, ivec2(0, 0), vec4(iTime, u_beat_count, u_tbeat, u_beat_conf));
+    imageStore(clkImg, ivec2(1, 0), vec4(u_ms_source, u_ms_drop_in, u_ms_bar_phase, 0.0));
+}
+#endif
+
+#define DUST_W       1024
+#define DUST_FIX     1000.0
+uint dHash(uint x) { x ^= x >> 16; x *= 0x7feb352du; x ^= x >> 15; x *= 0x846ca68bu; x ^= x >> 16; return x; }
+float dRnd(inout uint s) { s = dHash(s + 0x9e3779b9u); return float(s) / 4294967296.0; }
+#ifdef K_RZERO
+layout(local_size_x = 16, local_size_y = 16) in;
+layout(rgba32f, binding = 0) uniform writeonly image2D outImg;
+void main() {
+    ivec2 c = ivec2(gl_GlobalInvocationID.xy);
+    if (c.x >= NT || c.y >= NR) return;
+    imageStore(outImg, c, vec4(0.0));
+}
+#endif
+#ifdef K_PSEED
+layout(local_size_x = 256) in;
+layout(rgba32f, binding = 0) uniform writeonly image2D posImg;
+layout(rgba32f, binding = 1) uniform writeonly image2D velImg;
+uniform sampler2D u_src;
+uniform sampler2D u_phase;
+uniform int u_np;
+uniform float u_seed;
+void main() {
+    int i = int(gl_GlobalInvocationID.x);
+    if (i >= u_np) return;
+    uint sd = dHash(uint(i) * 747796405u + uint(u_seed));
+    float r = sqrt(mix(R_IN * R_IN, R_OUT * R_OUT, dRnd(sd)));
+    float th = 6.28318530718 * dRnd(sd);
+    int j = clamp(int((r - R_IN) / DR), 0, NR - 1);
+    float phi = texelFetch(u_phase, ivec2(j, 0), 0).x;
+    int k = int(floor(mod(th - phi, 6.28318530718) / DTH)) % NT;
+    vec4 F = texelFetch(u_src, ivec2(k, j), 0);
+    vec2 er = vec2(cos(th), sin(th)), et = vec2(-er.y, er.x);
+    vec2 v = er * F.y + et * (pow(r, -0.5) + F.z);
+    ivec2 q = ivec2(i % DUST_W, i / DUST_W);
+    imageStore(posImg, q, vec4(r * er.x, 0.0, r * er.y, F.x));
+    imageStore(velImg, q, vec4(v.x, 0.0, v.y, F.x > 2e-3 ? 1.0 : 0.0));
+}
+#endif
+#ifdef K_PMOVE
+layout(local_size_x = 256) in;
+layout(rgba32f, binding = 0) uniform image2D posImg;
+layout(rgba32f, binding = 1) uniform image2D velImg;
+layout(r32ui,   binding = 2) uniform uimage2D cntImg;
+uniform int u_np, u_nsub;
+uniform float u_h;
+uniform vec4 u_hole;
+uniform float u_holeR;
+uniform vec3 u_g;
+uniform vec3 u_bx, u_by, u_bz, u_bh;
+vec3 dAcc(vec3 x) {
+    float r2 = dot(x, x);
+    vec3 a = -x / (r2 * sqrt(r2)) + u_g;
+    if (u_hole.w > 0.0) { vec3 d = u_hole.xyz - x; float q = dot(d, d) + 0.0025; a += u_hole.w * d / (q * sqrt(q)); }
+    return a;
+}
+void main() {
+    int i = int(gl_GlobalInvocationID.x);
+    if (i >= u_np) return;
+    ivec2 q = ivec2(i % DUST_W, i / DUST_W);
+    vec4 P = imageLoad(posImg, q), V = imageLoad(velImg, q);
+    if (V.w < 0.5) return;
+    vec3 x = P.xyz, v = V.xyz;
+    for (int s = 0; s < u_nsub; s++) {
+        v += 0.5 * u_h * dAcc(x); x += u_h * v; v += 0.5 * u_h * dAcc(x);
+        vec3 b = vec3(dot(x, u_bx), dot(x, u_by), dot(x, u_bz)), bv = vec3(dot(v, u_bx), dot(v, u_by), dot(v, u_bz));
+        for (int k = 0; k < 3; k++) if (abs(b[k]) > u_bh[k]) { b[k] = sign(b[k]) * u_bh[k]; if (bv[k] * b[k] > 0.0) bv[k] *= -0.85; }
+        x = b.x * u_bx + b.y * u_by + b.z * u_bz; v = bv.x * u_bx + bv.y * u_by + bv.z * u_bz;
+        if (dot(x, x) < DW_R * DW_R || (u_hole.w > 0.0 && length(x - u_hole.xyz) < u_holeR)) { V.w = 0.0; break; }
+    }
+    if (any(isnan(x)) || any(isnan(v))) V.w = 0.0;
+    imageStore(posImg, q, vec4(x, P.w));
+    imageStore(velImg, q, vec4(v, V.w));
+    if (V.w > 0.5) imageAtomicAdd(cntImg, ivec2(0), 1u);
+}
+#endif
+#ifdef K_PCLEAR
+layout(local_size_x = 16, local_size_y = 16) in;
+layout(r32ui, binding = 0) uniform writeonly uimage2D dustImg;
+layout(r32ui, binding = 1) uniform writeonly uimage2D cntImg;
+uniform ivec2 u_canvas;
+void main() {
+    ivec2 c = ivec2(gl_GlobalInvocationID.xy);
+    if (c == ivec2(0)) imageStore(cntImg, ivec2(0), uvec4(0u));
+    if (c.x >= u_canvas.x || c.y >= u_canvas.y) return;
+    imageStore(dustImg, c, uvec4(0u));
+}
+#endif
+#ifdef K_PSPLAT
+layout(local_size_x = 256) in;
+layout(rgba32f, binding = 0) uniform readonly image2D posImg;
+layout(rgba32f, binding = 1) uniform readonly image2D velImg;
+layout(r32ui,   binding = 2) uniform uimage2D dustImg;
+uniform int u_np;
+uniform ivec2 u_canvas;
+uniform vec3 u_ro, u_fw, u_rt, u_up;
+uniform float u_fov, u_gain;
+void main() {
+    int i = int(gl_GlobalInvocationID.x);
+    if (i >= u_np) return;
+    ivec2 q = ivec2(i % DUST_W, i / DUST_W);
+    vec4 P = imageLoad(posImg, q), V = imageLoad(velImg, q);
+    if (V.w < 0.5 || P.w <= 0.0) return;
+    vec3 d = P.xyz - u_ro;
+    float z = dot(d, u_fw);
+    if (z < 0.05) return;
+    vec2 uv = vec2(dot(d, u_rt), dot(d, u_up)) / z;
+    vec2 f = uv / (2.0 * u_fov) * float(min(u_canvas.x, u_canvas.y)) + 0.5 * vec2(u_canvas) - 0.5;
+    ivec2 b = ivec2(floor(f));
+    vec2 w = f - vec2(b);
+    float m = P.w * u_gain * DUST_FIX;
+    for (int k = 0; k < 4; k++) {
+        ivec2 o = ivec2(k & 1, k >> 1), c = b + o;
+        if (any(lessThan(c, ivec2(0))) || any(greaterThanEqual(c, u_canvas))) continue;
+        float ww = (o.x == 1 ? w.x : 1.0 - w.x) * (o.y == 1 ? w.y : 1.0 - w.y);
+        imageAtomicAdd(dustImg, c, uint(m * ww + 0.5));
+    }
+}
+#endif
+
+#ifdef K_CSPLAT
+layout(local_size_x = 64) in;
+layout(rgba32f, binding = 0) uniform readonly image2D cmImg;
+layout(r32ui,   binding = 1) uniform uimage2D outImg;
+uniform ivec2 u_canvas, u_cmSize;
+uniform vec3 u_ro, u_fw, u_rt, u_up;
+uniform float u_fov;
+void main() {
+    int i = int(gl_GlobalInvocationID.x);
+    if (i >= u_cmSize.x * u_cmSize.y) return;
+    vec4 P = imageLoad(cmImg, ivec2(i % u_cmSize.x, i / u_cmSize.x));
+    if (P.w == 0.0) return;
+    vec3 d = P.xyz - u_ro;
+    float z = dot(d, u_fw);
+    if (z < 0.05) return;
+    float H = float(min(u_canvas.x, u_canvas.y));
+    vec2 f = vec2(dot(d, u_rt), dot(d, u_up)) / z / (2.0 * u_fov) * H + 0.5 * vec2(u_canvas);
+    float rad = (P.w > 0.0 ? 0.003 + 0.007 * min(P.w / 1.65, 1.0) : -P.w) * H / (2.0 * u_fov * z);
+    rad = max(rad, 0.7);
+    float br = P.w > 0.0 ? P.w : 1.0;
+    int R = int(min(ceil(2.5 * rad), 90.0));
+    rad = min(rad, 36.0);
+    ivec2 c0 = ivec2(f);
+    for (int y = -R; y <= R; y++) for (int x = -R; x <= R; x++) {
+        ivec2 c = c0 + ivec2(x, y);
+        if (any(lessThan(c, ivec2(0))) || any(greaterThanEqual(c, u_canvas))) continue;
+        vec2 o = vec2(c) + 0.5 - f;
+        float w = br * exp(-dot(o, o) / (rad * rad));
+        if (w > 0.002) imageAtomicAdd(outImg, c, uint(w * 1000.0));
+    }
+}
+#endif

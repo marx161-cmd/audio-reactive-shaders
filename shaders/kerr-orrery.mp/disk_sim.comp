@@ -1,0 +1,185 @@
+layout(local_size_x = 16, local_size_y = 16) in;
+
+layout(rgba32f, binding = 0) uniform readonly  image2D stateIn;
+layout(rgba32f, binding = 1) uniform readonly  image2D u0In;
+layout(rgba32f, binding = 2) uniform writeonly image2D stateOut;
+
+uniform int   NR, NPHI;
+uniform float X0, DX, DPHI;
+uniform float M_, A_, Q_, H_R;
+uniform float FLARE;
+uniform float R_IN, R_OUT;
+uniform float DT, TIME, FORCE_AMP;
+uniform float GAMMA_M1, COOL_BETA;
+uniform int   RK_PASS;
+
+float cellX(int i) { return X0 + (float(i) + 0.5) * DX; }
+float cellR(int i) { return exp(cellX(i)); }
+float faceR(int i) { return exp(X0 + float(i) * DX); }
+
+float omegaK(float r) {
+    float s = sqrt(max(M_ * r - Q_ * Q_, 0.0));
+    return s / (r * r + A_ * s);
+}
+float cs2At(float r) { float Om = omegaK(r); float h = H_R * pow(r / R_IN, FLARE); return (h * r * Om) * (h * r * Om); }
+
+float minmod(float a, float b) { return 0.5 * (sign(a) + sign(b)) * min(abs(a), abs(b)); }
+vec4  minmod4(vec4 a, vec4 b) { return 0.5 * (sign(a) + sign(b)) * min(abs(a), abs(b)); }
+
+vec4 primOf(vec4 U, float r) {
+    float S = max(U.x, 1e-8);
+    float T = max(U.w / S, 0.05 * cs2At(r));
+    return vec4(S, U.y / S, U.z / (S * r), T);
+}
+
+vec4 radFlux(vec4 pL, vec4 pR, float rf) {
+    float SL = pL.x, uL = pL.y, wL = pL.z, TL = pL.w, SR = pR.x, uR = pR.y, wR = pR.z, TR = pR.w;
+    float PL = SL * TL, PR = SR * TR;
+    vec4 F_L = vec4(SL * uL, SL * uL * uL + PL, SL * rf * wL * uL, SL * TL * uL);
+    vec4 F_R = vec4(SR * uR, SR * uR * uR + PR, SR * rf * wR * uR, SR * TR * uR);
+    vec4 U_L = vec4(SL, SL * uL, SL * rf * wL, SL * TL);
+    vec4 U_R = vec4(SR, SR * uR, SR * rf * wR, SR * TR);
+    float smax = max(abs(uL), abs(uR)) + sqrt(max(TL, TR));
+    return 0.5 * (F_L + F_R) - 0.5 * smax * (U_R - U_L);
+}
+
+vec4 aziFlux(vec4 pL, vec4 pR, float r) {
+    float SL = pL.x, uL = pL.y, wL = pL.z, TL = pL.w, SR = pR.x, uR = pR.y, wR = pR.z, TR = pR.w;
+    float PL = SL * TL, PR = SR * TR;
+    vec4 G_L = vec4(SL * wL, SL * uL * wL, SL * wL * wL + PL, SL * TL * wL);
+    vec4 G_R = vec4(SR * wR, SR * uR * wR, SR * wR * wR + PR, SR * TR * wR);
+    vec4 V_L = vec4(SL, SL * uL, SL * r * wL, SL * TL);
+    vec4 V_R = vec4(SR, SR * uR, SR * r * wR, SR * TR);
+    float smax = max(abs(wL), abs(wR)) + sqrt(max(TL, TR));
+    vec4 dis = vec4(smax, smax, smax / r, smax);
+    return 0.5 * (G_L + G_R) - 0.5 * dis * (V_R - V_L);
+}
+
+float hash3(vec3 p) {
+    p = fract(p * 0.3183099 + vec3(0.1, 0.2, 0.3));
+    p *= 17.0;
+    return fract(p.x * p.y * p.z * (p.x + p.y + p.z));
+}
+float noise3(vec3 p) {
+    vec3 i = floor(p), f = fract(p);
+    f = f * f * (3.0 - 2.0 * f);
+    float n000 = hash3(i + vec3(0, 0, 0)), n100 = hash3(i + vec3(1, 0, 0));
+    float n010 = hash3(i + vec3(0, 1, 0)), n110 = hash3(i + vec3(1, 1, 0));
+    float n001 = hash3(i + vec3(0, 0, 1)), n101 = hash3(i + vec3(1, 0, 1));
+    float n011 = hash3(i + vec3(0, 1, 1)), n111 = hash3(i + vec3(1, 1, 1));
+    return mix(mix(mix(n000, n100, f.x), mix(n010, n110, f.x), f.y),
+               mix(mix(n001, n101, f.x), mix(n011, n111, f.x), f.y), f.z);
+}
+#define KICK_SLICE 40.0
+vec2 kickNoise(vec3 p, float k) {
+    vec3 o = vec3(13.1, 7.7, 3.3) * k;
+    vec3 p2 = p * 2.33 + 19.7;
+    float nu = (noise3(p + o) - 0.5) + 0.5 * (noise3(p2 + o) - 0.5);
+    float nw = (noise3(p + o + 5.3) - 0.5) + 0.5 * (noise3(p2 + o + 5.3) - 0.5);
+    return vec2(nu, nw);
+}
+vec2 gasFrameKick(float r, float phi, float Om, float cs) {
+    float phiCo = phi - Om * TIME;
+    vec3  p = vec3(vec2(cos(phiCo), sin(phiCo)) * 3.0, log(r) * 3.0);
+    float s = TIME / KICK_SLICE, k = floor(s), f = s - k;
+    f = f * f * (3.0 - 2.0 * f);
+    vec2 n = kickNoise(p, k) * cos(1.5707963 * f) + kickNoise(p, k + 1.0) * sin(1.5707963 * f);
+    return FORCE_AMP * cs * Om * DT * n;
+}
+
+ivec2 nbR(ivec2 c, int di) { return ivec2(clamp(c.x + di, 0, NR - 1), c.y); }
+ivec2 nbP(ivec2 c, int dj) { return ivec2(c.x, (c.y + dj + 4 * NPHI) % NPHI); }
+
+vec4 rhs(readonly image2D src, ivec2 c, float r, float Om, float g_) {
+    vec4 Um2 = imageLoad(src, nbR(c, -2)), Um1 = imageLoad(src, nbR(c, -1));
+    vec4 U0  = imageLoad(src, c);
+    vec4 Up1 = imageLoad(src, nbR(c, 1)), Up2 = imageLoad(src, nbR(c, 2));
+    float rM1 = cellR(clamp(c.x - 1, 0, NR - 1)), rP1 = cellR(clamp(c.x + 1, 0, NR - 1));
+
+    vec4 slM1 = minmod4(Um1 - Um2, U0 - Um1);
+    vec4 sl0  = minmod4(U0 - Um1, Up1 - U0);
+    vec4 slP1 = minmod4(Up1 - U0, Up2 - Up1);
+
+    vec4 fluxL, fluxR;
+    float rfL = faceR(c.x), rfR = faceR(c.x + 1);
+    vec4 p0 = primOf(U0, r);
+    if (c.x == 0) {
+        float u0c = min(p0.y, 0.0);
+        fluxL = vec4(p0.x * u0c, p0.x * u0c * u0c + p0.x * p0.w, p0.x * rfL * p0.z * u0c, p0.x * p0.w * u0c);
+    } else {
+        fluxL = radFlux(primOf(Um1 + 0.5 * slM1, rM1), primOf(U0 - 0.5 * sl0, r), rfL);
+    }
+    if (c.x == NR - 1) {
+        fluxR = vec4(p0.x * p0.y, p0.x * p0.y * p0.y + p0.x * p0.w, p0.x * rfR * p0.z * p0.y, p0.x * p0.w * p0.y);
+    } else {
+        fluxR = radFlux(primOf(U0 + 0.5 * sl0, r), primOf(Up1 - 0.5 * slP1, rP1), rfR);
+    }
+    vec4 divR = (rfR * fluxR - rfL * fluxL) / (r * r * DX);
+
+    vec4 Vm2 = imageLoad(src, nbP(c, -2)), Vm1 = imageLoad(src, nbP(c, -1));
+    vec4 Vp1 = imageLoad(src, nbP(c, 1)),  Vp2 = imageLoad(src, nbP(c, 2));
+    vec4 aslM1 = minmod4(Vm1 - Vm2, U0 - Vm1);
+    vec4 asl0  = minmod4(U0 - Vm1, Vp1 - U0);
+    vec4 aslP1 = minmod4(Vp1 - U0, Vp2 - Vp1);
+
+    vec4 gRight = aziFlux(primOf(U0 + 0.5 * asl0, r), primOf(Vp1 - 0.5 * aslP1, r), r);
+    vec4 gLeft  = aziFlux(primOf(Vm1 + 0.5 * aslM1, r), primOf(U0 - 0.5 * asl0, r), r);
+    vec4 divP = vec4((gRight.x - gLeft.x) / (r * DPHI),
+                     (gRight.y - gLeft.y) / (r * DPHI),
+                     (gRight.z - gLeft.z) / DPHI,
+                     (gRight.w - gLeft.w) / (r * DPHI));
+
+    float P0 = p0.x * p0.w;
+    vec4 qm = primOf(Um1, rM1), qp = primOf(Up1, rP1);
+    vec4 am = primOf(Vm1, r),   ap = primOf(Vp1, r);
+    float dx2 = (c.x == 0 || c.x == NR - 1) ? DX : 2.0 * DX;
+    float divv = (rP1 * qp.y - rM1 * qm.y) / (r * r * dx2) + (ap.z - am.z) / (2.0 * r * DPHI);
+    float T0 = cs2At(r);
+    float heat = -GAMMA_M1 * U0.w * divv - (U0.w - p0.x * T0) * Om / COOL_BETA;
+    vec4 src_ = vec4(0.0, (p0.x * p0.z * p0.z + P0) / r + p0.x * g_, 0.0, heat);
+
+    return -divR - divP + src_;
+}
+
+void main() {
+    ivec2 c = ivec2(gl_GlobalInvocationID.xy);
+    if (c.x >= NR || c.y >= NPHI) return;
+
+    float r = cellR(c.x);
+    float phi = (float(c.y) + 0.5) * DPHI;
+    float Om = omegaK(r);
+    float g_ = -r * Om * Om;
+    float T0 = cs2At(r);
+
+    vec4 k = rhs(stateIn, c, r, Om, g_);
+
+    vec4 Uresult;
+    if (RK_PASS == 0) {
+        vec4 U0 = imageLoad(stateIn, c);
+        Uresult = U0 + DT * k;
+    } else {
+        vec4 U1 = imageLoad(stateIn, c);
+        vec4 U0 = imageLoad(u0In, c);
+        vec4 k1 = (U1 - U0) / DT;
+        Uresult = U0 + 0.5 * DT * (k1 + k);
+        Uresult.x = max(Uresult.x, 1e-8);
+
+        vec2 kick = gasFrameKick(r, phi, Om, sqrt(T0));
+        float S = Uresult.x;
+        float u = Uresult.y / S, w = Uresult.z / (S * r);
+        u += kick.x; w += kick.y;
+        Uresult.y = S * u; Uresult.z = S * r * w;
+
+        float wo = 0.85 * R_OUT;
+        float f = max(0.0, (r - wo) / (R_OUT - wo)); f = f * f;
+        float rate = f * Om / 6.28318530718 * 10.0 * DT;
+        float S0 = pow(r, -0.5) * (1.0 - 0.7 * exp(-(r - R_IN) / (0.3 * R_IN)));
+        float w0 = r * Om;
+        vec4 target = vec4(S0, 0.0, S0 * r * w0, S0 * T0);
+        Uresult = Uresult - rate * (Uresult - target);
+    }
+    Uresult.x = max(Uresult.x, 1e-8);
+    Uresult.w = clamp(Uresult.w, 0.05 * Uresult.x * T0, 25.0 * Uresult.x * T0);
+
+    imageStore(stateOut, c, Uresult);
+}

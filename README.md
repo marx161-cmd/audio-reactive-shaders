@@ -48,8 +48,48 @@ as ruby crystal pins (refraction, total internal reflection, absorption; light
 walks from pin to pin), with chord tones outlined in green, an outer ring of
 pins for the drums, and two UV fairy lights that fly over it leaving trails.
 
-**Disnub-Diamond-Checker-Tunnel** (`shaders/disnub-diamond-checker-tunnel.mp`):
-the great disnub diamond in front of a checker tunnel instead of the window.
+### More black holes
+
+**Kerr-Orrery** (`shaders/kerr-orrery.mp`): the Kerr-Newman hole with its stars,
+planets and moons on plain Kepler orbits timed to the tempo, seen from a camera
+that circles the hole on its equator. The camera rests inside a song section
+and swings a quarter turn on every section change. Every 16 beats a star is torn
+apart: its gas stream and the disk it forms are a flipbook rendered offline by
+the original Kerr-Newman renderer, so the gas is lensed exactly. With a song
+analysis (see `song_replay.py`) the `director/` plans which bodies pass behind
+the hole on which beats; that mode is heavy (about 6 fps live on an RX 9060 XT)
+and meant for video renders.
+
+**Kerr-Tidal-Disruption** (`shaders/kerr-tidal-disruption.mp`): the Kerr
+visualizer from its fixed pose with the same torn star: a glowing victim swings
+in every 16 beats and is pulled into a stream and a disk that forms and drains.
+
+### Physics toys
+
+**Ringbox** (`shaders/ringbox.mp`): a star and three moons (REBOUND N-body)
+in a big box with a ring of 16 M massless grains on the GPU. Moons merge and
+heat up on contact; the star swallows what hits it. Two ships keep the moons in
+their slots as a team: lasers push by light pressure, nukes blast material off
+that becomes ring grains, and a moon that has lost most of its mass is
+demolished into grains. The sun is drawn from real observed maps (photosphere
+and 304 Å chromosphere). The ships, modes and camera are played from a phone
+pad (see "Controls").
+
+**Brown-Dwarf** (`shaders/brown-dwarf.mp`): a brown dwarf with a fluid ring
+and chrome moons. A note fires its moon's lightning into the ring (grown live
+by dielectric breakdown), aurora curtains come from a small vorticity fluid,
+and meteors make physical flybys timed to the downbeat. Boop anything under the
+cursor (see "Controls").
+
+**Brown-Dwarf-Glass-Box** (`shaders/brown-dwarf-glass-box.mp`): the same
+system inside a box. This one is a music box: the moon orbits and hit timing
+run on rails, while meteor flight and the ring fluid are real. Two ships shoot
+from the star's beams; when the moons and the ring are gone, a hole eats the
+rest and the dwarf spits the bodies back out, each with a correction meteor
+planned offline in a worker process.
+
+### Swarms and worms
+
 
 **Ember-Flock-Metal-Pit** (`shaders/ember-flock-metal-pit.mp`, portrait
 canvas): two flocks of burning embers chasing hunter heads in a pit seen from
@@ -64,6 +104,16 @@ its 18 steering knobs ship at the setting a live parameter search picked
 through the centre, shedding goo that keeps the colour it was born with. On
 every section change one worm picks a new colour from a mood palette. The pad
 version is steered from a phone pad.
+
+### Gems
+
+**Armillary-Gem-Sphere** (`shaders/armillary-gem-sphere.mp`): a beat-locked
+gimbal of hexagonal ruby and diamond rings on pentagonal rods around a
+round-brilliant sapphire, the only light, traced per colour channel through
+every facet, in volumetric mist in front of a lit image backdrop.
+
+**Disnub-Diamond-Checker-Tunnel** (`shaders/disnub-diamond-checker-tunnel.mp`):
+the great disnub diamond in front of a checker tunnel instead of the window.
 
 ### Phone wallpapers
 
@@ -106,8 +156,9 @@ track file ──> video/render_video.py (same band analysis, offline) ───
 - Linux, X11 (the backdrop uses X11 override-redirect windows; Wayland is not supported)
 - The patched EasyEffects from [easyeffects-shader-bands](https://github.com/marx161-cmd/easyeffects-shader-bands)
 - An OpenGL 3.3 GPU. VRAM: the Kerr shader keeps about 6.6 GB of tables on
-  the GPU (plan for 8 GB free), the Nebulabrot about 9 GB (realistically a 16 GB
-  card), the rest well under 1 GB.
+  the GPU (plan for 8 GB free; the orrery and tidal-disruption versions about
+  7 GB), the Nebulabrot about 9 GB (realistically a 16 GB card), the brown dwarfs
+  about 3.5 GB (the sky), the rest well under 1 GB.
 - Python 3.11+, `playerctl` (optional: per-song beat maps), ffmpeg with
   `av1_vaapi` for the video pipeline
 
@@ -117,7 +168,7 @@ track file ──> video/render_video.py (same band analysis, offline) ───
 git clone https://github.com/marx161-cmd/audio-reactive-shaders ~/audio-reactive-shaders
 cd ~/audio-reactive-shaders
 python3 -m venv .venv && .venv/bin/pip install -r requirements.txt
-python3 download_data.py            # all data, ~16 GB; or pick groups, see --help
+python3 download_data.py            # all data, ~17 GB; or pick groups, see --help
 cp config.example.toml config.toml  # optional: audio delay, which monitors
 echo kerr-black-hole-visualizer.mp > active_shader.txt
 .venv/bin/python3 renderer.py
@@ -139,12 +190,16 @@ dir=~/audio-reactive-shaders
 The backdrop never takes keyboard focus. Bind `contrib/orrery-cam`
 (`up|down|left|right|in|out|reset`) to window-manager keys to move the camera.
 
-Lagoon-Worms-Pad and Ember-Flock-Metal-Pit read a phone pad: the
+The physics shaders take **the hand**: hold the steer key (Super) and tap
+Alt to boop whatever is under the cursor; steer key + Ctrl + Shift resets.
+
+Ringbox, Lagoon-Worms-Pad, Ember-Flock-Metal-Pit and Brown-Dwarf-Glass-Box read a phone pad: the
 [DroidPad](https://github.com/umer0586/DroidPad) app sends its widgets over
 MQTT, `contrib/droidpad-shader-bridge` (needs `paho-mqtt` and a broker such as
 mosquitto) writes them to `pad.json`, and the renderer reads that. Import the
 matching profile from `contrib/pads/` (`mycontrolpad-2.json` for the worms,
-`ember.json` for the embers) into DroidPad and set your broker's address (the
+`ember.json` for the embers, `ringbox.json`, `brown_dwarf_diorama.json` for the glass
+box) into DroidPad and set your broker's address (the
 files say `YOUR_BROKER_IP`).
 
 For the Nebulabrot, bind `tools/dive.py next`, `tools/dive.py prev` and
@@ -183,6 +238,9 @@ Everything `download_data.py` fetches can be rebuilt:
 | `textures/pulsar_orrery/*.npy` | `pulsar_orrery_prep.py` | see credits |
 | `textures/nebulabrot/*.npy` | `nebula_bake_modal.py` (Modal H100; uniform, window and Metropolis modes), then `nebula_prep.py`, `nebula_window_prep.py`, `nebula_eq_prep.py` | the Mandelbrot iteration |
 | `textures/illusion_diamond/backdrops/*_glass_data.png` | `stained_glass_prep.py` | the stained-glass image |
+| `textures/kerr_v7/kn/lens_inv.npy`, `lens_inv_count.npy` | `lens_inv_bake.py` (from `paths32.npy`) | the Kerr-Newman bake |
+| `textures/slurp/gasbake_flip.npy` | not rebuildable from this repo: rendered offline with the original Kerr-Newman renderer | |
+| `textures/fbm_drop_v6/backdrop_*` | the image, plus depth and normals from [Marigold](https://github.com/prs-eth/Marigold) | the author's image |
 
 The older NASA SVS star map (`textures/starfield/sky64k/`, `skycube_unpack.py` +
 `skycube_bake.py`) is still in the dataset for the previous Kerr version but no
@@ -211,7 +269,13 @@ bake for zeroed samples before using it.
 - Sun and Saturn textures (and the ring alpha): [Solar System Scope](https://www.solarsystemscope.com/textures/), CC BY 4.0.
 - Chromosphere: NASA STEREO/EUVI + SDO/AIA 304 Å Carrington map.
 - Moon surface: NASA LRO / LROC.
-- Liquid-metal walls of the ember pit: after mrange's *Liquid Metal* (Shadertoy 3t2czh, CC0).
+- Liquid-metal walls of the ember pit and the gem sphere's backdrop metal: after mrange's *Liquid Metal*
+  (Shadertoy 3t2czh, CC0).
+- Ringbox: [REBOUND](https://github.com/hannorein/rebound) N-body code (GPL-3.0).
+- Fluid surfaces (dwarfs, the Kerr red dwarf, the ringbox star, the gem rings): `flowfluid`, written for this repo
+  (`shaders/_lib/flowfluid.glsl`; its integer hash folds through Chris Wellons' *lowbias32*, public domain).
+- Small helpers: *Hash without Sine* by Dave Hoskins (MIT); the gem sphere's value-noise hash and its hexagon /
+  round-cone distance functions after Inigo Quilez (MIT).
 
 ## License
 

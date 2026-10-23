@@ -1,0 +1,174 @@
+#define A_R0  0.23
+#define A_R1  2.42
+#define A_VT  512
+#define A_VR  96
+#define A_FT  2048
+#define A_FR  384
+#define TWO_PI 6.28318530718
+uniform sampler2D u_vSrc;
+uniform sampler2D u_fSrc;
+uniform sampler2D u_vPhase;
+uniform sampler2D u_fPhase;
+uniform sampler2D u_moons;
+uniform sampler2D u_notes;
+uniform float u_h;
+uniform float u_dtReal;
+uniform float u_simT;
+uniform vec4 u_vort[4];
+uniform int u_nVort;
+uniform int u_parity;
+uniform float iTime;
+const int PC_MOON_A[12] = int[12](2, 0, 3, 7, 4, 8, 5, 1, 6, 2, 7, 3);
+
+float aRow(float r, int nr) { return (r - A_R0) / (A_R1 - A_R0) * float(nr) - 0.5; }
+float aRowR(int j, int nr) { return A_R0 + (float(j) + 0.5) * (A_R1 - A_R0) / float(nr); }
+vec4 aSample(sampler2D tex, sampler2D ph, int nt, int nr, float r, float th, int which) {
+    float jf = clamp(aRow(r, nr), 0.0, float(nr - 1));
+    int j0 = int(floor(jf)); float fj = jf - float(j0);
+    vec4 res = vec4(0.0);
+    for (int q = 0; q < 2; q++) {
+        int j = min(j0 + q, nr - 1);
+        vec2 p = texelFetch(ph, ivec2(j, 0), 0).xy;
+        float rel = mod(th - (which == 0 ? p.x : p.y), TWO_PI);
+        float kf = rel / (TWO_PI / float(nt)) - 0.5;
+        int k0 = int(floor(kf)); float fk = kf - float(k0);
+        vec4 a = texelFetch(tex, ivec2((k0 % nt + nt) % nt, j), 0);
+        vec4 b = texelFetch(tex, ivec2(((k0 + 1) % nt + nt) % nt, j), 0);
+        res += mix(a, b, fk) * (q == 0 ? 1.0 - fj : fj);
+    }
+    return res;
+}
+float aHash(vec3 p) { p = fract(p * 0.1031); p += dot(p, p.zyx + 31.32); return fract((p.x + p.y) * p.z); }
+float aNoise(vec3 p) {
+    vec3 i = floor(p), f = fract(p); f = f * f * (3.0 - 2.0 * f);
+    return mix(mix(mix(aHash(i), aHash(i + vec3(1, 0, 0)), f.x), mix(aHash(i + vec3(0, 1, 0)), aHash(i + vec3(1, 1, 0)), f.x), f.y),
+               mix(mix(aHash(i + vec3(0, 0, 1)), aHash(i + vec3(1, 0, 1)), f.x), mix(aHash(i + vec3(0, 1, 1)), aHash(i + vec3(1, 1, 1)), f.x), f.y), f.z);
+}
+float nebula(float r, float th, float t) {
+    float a = th - 0.38 * t;
+    vec3 p = vec3(r * cos(a), r * sin(a), 0.02 * t) * 9.0;
+    float v = 0.0, w = 0.5;
+    for (int i = 0; i < 4; i++) { v += w * aNoise(p); p *= 2.1; w *= 0.5; }
+    return smoothstep(0.42, 0.75, v);
+}
+
+#define V_DAMP    40.0
+#define F_GAS_TAU 30.0
+#define EG_TAU    0.7
+#define ER_TAU    4.0
+#define PUMP_T    0.15
+#define PUMP_R    0.09
+#define PUMP_K    1.0
+#define SOR       1.0
+
+#ifdef K_A_INIT
+layout(local_size_x = 16, local_size_y = 16) in;
+layout(rgba32f, binding = 0) uniform writeonly image2D vOut;
+layout(rgba32f, binding = 1) uniform writeonly image2D fOut;
+void main() {
+    ivec2 c = ivec2(gl_GlobalInvocationID.xy);
+    if (c.x < A_VT && c.y < A_VR) imageStore(vOut, c, vec4(0.0));
+    if (c.x < A_FT && c.y < A_FR) {
+        float r = aRowR(c.y, A_FR), th = (float(c.x) + 0.5) * TWO_PI / float(A_FT);
+        imageStore(fOut, c, vec4(nebula(r, th, 0.0), 0.0, 0.0, 0.0));
+    }
+}
+#endif
+
+#ifdef K_A_VORT
+layout(local_size_x = 16, local_size_y = 16) in;
+layout(rgba32f, binding = 0) uniform writeonly image2D vOut;
+void main() {
+    ivec2 c = ivec2(gl_GlobalInvocationID.xy);
+    if (c.x >= A_VT || c.y >= A_VR) return;
+    float r = aRowR(c.y, A_VR);
+    vec2 ph = texelFetch(u_vPhase, ivec2(c.y, 0), 0).xy;
+    float th = (float(c.x) + 0.5) * TWO_PI / float(A_VT) + ph.x;
+    vec4 F = texelFetch(u_vSrc, c, 0);
+    if (any(isnan(F)) || any(isinf(F))) F = vec4(0.0);
+    float rd = clamp(r - F.z * u_h, A_R0, A_R1);
+    float thd = th - (pow(0.5 * (r + rd), -1.5) + F.w / r) * u_h;
+    float w = aSample(u_vSrc, u_vPhase, A_VT, A_VR, rd, thd, 1).x * exp(-u_h / V_DAMP);
+    for (int i = 0; i < u_nVort; i++) {
+        vec4 v = u_vort[i];
+        float dth = mod(th - v.y + 3.14159265, TWO_PI) - 3.14159265;
+        vec2 d = vec2(r - v.x, r * dth);
+        w += v.z * exp(-dot(d, d) / (v.w * v.w));
+    }
+    if (c.y == 0 || c.y == A_VR - 1 || isnan(w) || isinf(w)) w = 0.0;
+    imageStore(vOut, c, vec4(clamp(w, -60.0, 60.0), F.y, F.z, F.w));
+}
+#endif
+
+#ifdef K_A_PSI
+layout(local_size_x = 16, local_size_y = 16) in;
+layout(rgba32f, binding = 0) uniform image2D vImg;
+void main() {
+    ivec2 c = ivec2(gl_GlobalInvocationID.xy);
+    if (c.x >= A_VT || c.y >= A_VR || ((c.x + c.y) & 1) != u_parity) return;
+    vec4 F = imageLoad(vImg, c);
+    if (c.y == 0 || c.y == A_VR - 1) { F.y = 0.0; imageStore(vImg, c, F); return; }
+    float r = aRowR(c.y, A_VR), dr = (A_R1 - A_R0) / float(A_VR), dth = TWO_PI / float(A_VT);
+    float th = (float(c.x) + 0.5) * dth + texelFetch(u_vPhase, ivec2(c.y, 0), 0).x;
+    float pE = imageLoad(vImg, ivec2((c.x + 1) % A_VT, c.y)).y, pW = imageLoad(vImg, ivec2((c.x + A_VT - 1) % A_VT, c.y)).y;
+    float pN = aSample(u_vSrc, u_vPhase, A_VT, A_VR, r + dr, th, 0).y, pS = aSample(u_vSrc, u_vPhase, A_VT, A_VR, r - dr, th, 0).y;
+    float ar = 1.0 / (dr * dr), at = 1.0 / (r * r * dth * dth);
+    float gs = (ar * (pN * (1.0 + 0.5 * dr / r) + pS * (1.0 - 0.5 * dr / r)) + at * (pE + pW) + F.x) / (2.0 * ar + 2.0 * at);
+    F.y = mix(F.y, gs, SOR);
+    if (isnan(F.y) || isinf(F.y)) F.y = 0.0;
+    F.y = clamp(F.y, -0.5, 0.5);
+    imageStore(vImg, c, F);
+}
+#endif
+
+#ifdef K_A_VEL
+layout(local_size_x = 16, local_size_y = 16) in;
+layout(rgba32f, binding = 0) uniform image2D vImg;
+void main() {
+    ivec2 c = ivec2(gl_GlobalInvocationID.xy);
+    if (c.x >= A_VT || c.y >= A_VR) return;
+    vec4 F = imageLoad(vImg, c);
+    float r = aRowR(c.y, A_VR), dr = (A_R1 - A_R0) / float(A_VR), dth = TWO_PI / float(A_VT);
+    float th = (float(c.x) + 0.5) * dth + texelFetch(u_vPhase, ivec2(c.y, 0), 0).x;
+    float pE = imageLoad(vImg, ivec2((c.x + 1) % A_VT, c.y)).y, pW = imageLoad(vImg, ivec2((c.x + A_VT - 1) % A_VT, c.y)).y;
+    float pN = aSample(u_vSrc, u_vPhase, A_VT, A_VR, min(r + dr, A_R1), th, 0).y;
+    float pS = aSample(u_vSrc, u_vPhase, A_VT, A_VR, max(r - dr, A_R0), th, 0).y;
+    F.z = clamp((pE - pW) / (2.0 * r * dth), -0.2, 0.2);
+    F.w = clamp(-(pN - pS) / (2.0 * dr), -0.2, 0.2);
+    if (any(isnan(F.zw))) F.zw = vec2(0.0);
+    imageStore(vImg, c, F);
+}
+#endif
+
+#ifdef K_A_GAS
+layout(local_size_x = 16, local_size_y = 16) in;
+layout(rgba32f, binding = 0) uniform writeonly image2D fOut;
+void main() {
+    ivec2 c = ivec2(gl_GlobalInvocationID.xy);
+    if (c.x >= A_FT || c.y >= A_FR) return;
+    float r = aRowR(c.y, A_FR);
+    float th = (float(c.x) + 0.5) * TWO_PI / float(A_FT) + texelFetch(u_fPhase, ivec2(c.y, 0), 0).x;
+    vec4 V = aSample(u_vSrc, u_vPhase, A_VT, A_VR, r, th, 0);
+    float rd = clamp(r - V.z * u_h, A_R0, A_R1);
+    float thd = th - (pow(0.5 * (r + rd), -1.5) + V.w / r) * u_h;
+    vec4 f = aSample(u_fSrc, u_fPhase, A_FT, A_FR, rd, thd, 1);
+    f.x += (nebula(r, th, u_simT) - f.x) * (1.0 - exp(-u_h / F_GAS_TAU));
+    f.y *= exp(-u_dtReal / EG_TAU);
+    f.z *= exp(-u_dtReal / ER_TAU);
+    vec3 P = vec3(r * cos(th), 0.0, r * sin(th));
+    for (int pc = 0; pc < 12; pc++) {
+        vec4 nt = texelFetch(u_notes, ivec2(pc, 0), 0);
+        float age = iTime - nt.z;
+        if (age < 0.0 || age > PUMP_T) continue;
+        vec4 Mm = texelFetch(u_moons, ivec2(PC_MOON_A[pc], 0), 0);
+        if (Mm.w <= 0.0) continue;
+        vec3 S = strikePoint(Mm.xyz, texelFetch(u_notes, ivec2(pc, 1), 0).x, pc);
+        vec3 d = P - S;
+        float pump = PUMP_K * nt.w * u_dtReal / PUMP_T * exp(-dot(d, d) / (PUMP_R * PUMP_R));
+        f.y += pump; f.z += pump;
+    }
+    if (any(isnan(f)) || any(isinf(f))) f = vec4(nebula(r, th, u_simT), 0.0, 0.0, 0.0);
+    f.yz = min(f.yz, vec2(3.0));
+    imageStore(fOut, c, f);
+}
+#endif

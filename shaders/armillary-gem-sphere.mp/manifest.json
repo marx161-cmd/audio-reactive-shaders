@@ -1,0 +1,73 @@
+{
+  "buffers": [
+    "A",
+    "B",
+    "C",
+    "D"
+  ],
+  "wiring": {
+    "A": {
+      "1": {
+        "type": "buffer",
+        "id": "B"
+      },
+      "2": {
+        "type": "buffer",
+        "id": "C"
+      },
+      "3": {
+        "type": "buffer",
+        "id": "D"
+      }
+    },
+    "B": {
+      "1": {
+        "type": "self"
+      }
+    },
+    "C": {
+      "1": {
+        "type": "buffer",
+        "id": "B"
+      }
+    },
+    "Image": {
+      "0": {
+        "type": "buffer",
+        "id": "A"
+      },
+      "1": {
+        "type": "buffer",
+        "id": "B"
+      },
+      "2": {
+        "type": "buffer",
+        "id": "C"
+      },
+      "3": {
+        "type": "buffer",
+        "id": "D"
+      }
+    },
+    "D": {
+      "1": {
+        "type": "buffer",
+        "id": "B"
+      }
+    }
+  },
+  "static_textures": {
+    "u_bolts": "textures/fbm_drop_v3/bolts_u8.npy",
+    "u_hops": "textures/fbm_drop_v3/hops_f32.npy",
+    "u_backdrop": "textures/fbm_drop_v6/backdrop_u8.npy",
+    "u_bg_normal": "textures/fbm_drop_v6/backdrop_normal_f16.npy",
+    "u_bg_depth": "textures/fbm_drop_v6/backdrop_depth_f32.npy"
+  },
+  "static_texture_filters": {
+    "u_hops": "nearest",
+    "u_backdrop": "linear_mip",
+    "u_bg_normal": "linear_mip",
+    "u_bg_depth": "linear_mip"
+  },
+  "fps": 30
+}

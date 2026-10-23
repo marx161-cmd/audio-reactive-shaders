@@ -1,0 +1,109 @@
+{
+  "controlPad": {
+    "name": "ringbox",
+    "orientation": "PORTRAIT",
+    "width": 1280,
+    "height": 2587
+  },
+  "controlPadItems": [
+    {
+      "itemIdentifier": "off",
+      "controlPadId": 4,
+      "itemType": "SWITCH",
+      "offsetX": 640.0,
+      "offsetY": 280.0,
+      "scale": 1.6,
+      "properties": "{\"label\": \"REMOTE (on = ctrl)\", \"trackColor\": 18386572518195462144, \"thumbColor\": 18440251418892828672, \"checkedColor\": 18388126355758776320}"
+    },
+    {
+      "itemIdentifier": "Moon Shocks",
+      "controlPadId": 4,
+      "itemType": "SWITCH",
+      "offsetX": 1040.0,
+      "offsetY": 280.0,
+      "scale": 1.3,
+      "properties": "{\"label\": \"PORTRAIT CAM\", \"trackColor\": 18386572518195462144, \"thumbColor\": 18440251418892828672, \"checkedColor\": 18388126355758776320}"
+    },
+    {
+      "itemIdentifier": "ring_farm_off",
+      "controlPadId": 4,
+      "itemType": "SWITCH",
+      "offsetX": 610.0,
+      "offsetY": 400.0,
+      "scale": 1.3,
+      "properties": "{\"label\": \"RING FARM OFF\", \"trackColor\": 18386572518195462144, \"thumbColor\": 18440251418892828672, \"checkedColor\": 18391058594356264960}"
+    },
+    {
+      "itemIdentifier": "Dwarf Big Shock",
+      "controlPadId": 4,
+      "itemType": "BUTTON",
+      "offsetX": 640.0,
+      "offsetY": 650.0,
+      "scale": 2.0,
+      "properties": "{\"text\": \"STAR SLING\", \"label\": \"C brake + retro catch\", \"useClickAction\": true, \"buttonColor\": 18391058594356264960, \"textColor\": 18440251418892828672}"
+    },
+    {
+      "itemIdentifier": "Moon Shock",
+      "controlPadId": 4,
+      "itemType": "BUTTON",
+      "offsetX": 640.0,
+      "offsetY": 980.0,
+      "scale": 2.4,
+      "properties": "{\"text\": \"SLINGSHOT\", \"label\": \"normal -> sling target\", \"useClickAction\": true, \"buttonColor\": 18384884815091466240, \"textColor\": 18440251418892828672}"
+    },
+    {
+      "itemIdentifier": "mode_recover",
+      "controlPadId": 4,
+      "itemType": "BUTTON",
+      "offsetX": 960.0,
+      "offsetY": 980.0,
+      "scale": 1.7,
+      "properties": "{\"text\": \"RECOVER\", \"label\": \"bring the pair back\", \"useClickAction\": true, \"buttonColor\": 18384884815091466240, \"textColor\": 18440251418892828672}"
+    },
+    {
+      "itemIdentifier": "mode_rosette",
+      "controlPadId": 4,
+      "itemType": "BUTTON",
+      "offsetX": 960.0,
+      "offsetY": 1280.0,
+      "scale": 1.7,
+      "properties": "{\"text\": \"ROSETTE\", \"label\": \"C drops, A leads, 120 deg\", \"useClickAction\": true, \"buttonColor\": 18388126355758776320, \"textColor\": 18440251418892828672}"
+    },
+    {
+      "itemIdentifier": "refill",
+      "controlPadId": 4,
+      "itemType": "BUTTON",
+      "offsetX": 640.0,
+      "offsetY": 1280.0,
+      "scale": 1.9,
+      "properties": "{\"text\": \"REFILL MOON\", \"label\": \"heavy charge at the star\", \"useClickAction\": true, \"buttonColor\": 18388126355758776320, \"textColor\": 18440251418892828672}"
+    },
+    {
+      "itemIdentifier": "Ring Aurora",
+      "controlPadId": 4,
+      "itemType": "BUTTON",
+      "offsetX": 640.0,
+      "offsetY": 1580.0,
+      "scale": 1.9,
+      "properties": "{\"text\": \"NORMAL\", \"label\": \"back to normal\", \"useClickAction\": true, \"buttonColor\": 18400065587452575744, \"textColor\": 18440251418892828672}"
+    },
+    {
+      "itemIdentifier": "star_tint",
+      "controlPadId": 4,
+      "itemType": "BUTTON",
+      "offsetX": 640.0,
+      "offsetY": 1840.0,
+      "scale": 1.5,
+      "properties": "{\"text\": \"STAR COLOUR\", \"label\": \"white/blue / orange / red\", \"useClickAction\": true, \"buttonColor\": 18388126355758776320, \"textColor\": 18440251418892828672}"
+    },
+    {
+      "itemIdentifier": "Mouse",
+      "controlPadId": 4,
+      "itemType": "STEP_SLIDER",
+      "offsetX": 640.0,
+      "offsetY": 2140.0,
+      "scale": 1.55,
+      "properties": "{\"minValue\": 0.0, \"maxValue\": 2.0, \"steps\": 1, \"showValue\": true, \"label\": \"mouse: off / poke / grab\", \"thumbColor\": 18440251418892828672, \"trackColor\": 18391093795908222976}"
+    }
+  ]
+}

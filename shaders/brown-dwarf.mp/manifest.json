@@ -1,0 +1,15 @@
+{
+  "buffers": [],
+  "wiring": {},
+  "compute": {
+    "script": "sim.py"
+  },
+  "static_textures": {
+    "u_bolts": "textures/brown_dwarf/bolt_decals_u8.npy",
+    "u_skycube": "textures/starfield/gaia_cube_g117_max/gaia_cube.json",
+    "u_nebula": "textures/starfield/nebula_photo4.npy"
+  },
+  "static_texture_filters": {
+    "u_nebula": "linear_mip"
+  }
+}

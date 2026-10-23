@@ -1,0 +1,31 @@
+{
+  "canvas": [
+    2410,
+    2410
+  ],
+  "buffers": [],
+  "wiring": {},
+  "compute": {
+    "script": "sim.py"
+  },
+  "static_textures": {
+    "u_bolts": "textures/brown_dwarf/bolt_decals_u8.npy",
+    "u_skycube": "textures/starfield/gaia_cube_g117_max/gaia_cube.json",
+    "u_nebula": "textures/starfield/nebula_photo4.npy",
+    "u_gBack": "textures/stained_glass_space/floor-backwall.png",
+    "u_gWL": "textures/stained_glass_space/long-wall-l.png",
+    "u_gWR": "textures/stained_glass_space/long-wall-r.png",
+    "u_gTop": "textures/stained_glass_space/short-wall-top.png",
+    "u_gBot": "textures/stained_glass_space/short-wall.png",
+    "u_moonMap": "textures/moon_sphere/iChannel0.png"
+  },
+  "static_texture_filters": {
+    "u_nebula": "linear_mip",
+    "u_gBack": "linear_mip",
+    "u_gWL": "linear_mip",
+    "u_gWR": "linear_mip",
+    "u_gTop": "linear_mip",
+    "u_gBot": "linear_mip",
+    "u_moonMap": "linear_mip"
+  }
+}

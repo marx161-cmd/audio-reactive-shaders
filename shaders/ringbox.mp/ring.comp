@@ -1,0 +1,215 @@
+#ifdef K_CLEAR
+layout(local_size_x = 16, local_size_y = 16) in;
+layout(r32ui, binding = 0) uniform writeonly uimage2D accImg;
+uniform ivec2 u_canvas;
+void main() {
+    ivec2 p = ivec2(gl_GlobalInvocationID.xy);
+    if (p.x < u_canvas.x && p.y < u_canvas.y) imageStore(accImg, p, uvec4(0u));
+}
+#endif
+
+#ifdef K_GRAIN
+layout(local_size_x = 16, local_size_y = 16) in;
+layout(rgba32f, binding = 0) uniform image2D posImg;
+layout(rgba32f, binding = 1) uniform image2D velImg;
+layout(r32ui,   binding = 2) uniform uimage2D accImg;
+uniform float u_h;
+uniform vec4 u_star;
+uniform float u_starR;
+uniform vec4 u_m0, u_m1, u_m2, u_m3;
+uniform vec4 u_mr;
+uniform float u_boxW, u_wallE;
+uniform vec3 u_ro, u_fw, u_rt, u_up;
+uniform float u_fov;
+uniform ivec2 u_canvas;
+uniform int u_gw;
+#define SUBSTEPS 2
+uniform float u_splatK;
+uniform float u_starLum;
+uniform float u_flare;
+uniform vec3 u_flareDir;
+#define SHADOW_K 0.15
+layout(r32ui, binding = 3) uniform uimage2D cntImg;
+uniform int u_cbase;
+uniform int u_countLive;
+uniform float u_prK;
+uniform vec3 u_starV;
+uniform vec4 u_hand;
+layout(r32ui, binding = 4) uniform uimage2D gridImg;
+uniform int u_gridOn;
+#define RING_GRID_N 48
+#define RING_GRID_HALF 3.0
+uniform float u_handR;
+
+vec3 pull(vec3 c, float gm, vec3 x) {
+    vec3 d = c - x;
+    float r2 = max(dot(d, d), 1e-8);
+    return gm * d * inversesqrt(r2) / r2;
+}
+vec3 acc(vec3 x) {
+    vec3 a = pull(u_star.xyz, u_star.w, x);
+    if (u_m0.w > 0.0) a += pull(u_m0.xyz, u_m0.w, x);
+    if (u_m1.w > 0.0) a += pull(u_m1.xyz, u_m1.w, x);
+    if (u_m2.w > 0.0) a += pull(u_m2.xyz, u_m2.w, x);
+    if (u_m3.w > 0.0) a += pull(u_m3.xyz, u_m3.w, x);
+    return a;
+}
+bool inside(vec3 x, vec4 m, float r) { return m.w > 0.0 && dot(x - m.xyz, x - m.xyz) < r * r; }
+bool blocks(vec3 a, vec3 b, vec3 c, float r) {
+    vec3 d = b - a;
+    float L = length(d);
+    d /= L;
+    float t = clamp(dot(c - a, d), 0.0, L);
+    vec3 q = a + d * t - c;
+    return dot(q, q) < r * r;
+}
+bool blockedAny(vec3 a, vec3 b) {
+    if (blocks(a, b, u_star.xyz, u_starR)) return true;
+    if (u_m0.w > 0.0 && blocks(a, b, u_m0.xyz, u_mr.x)) return true;
+    if (u_m1.w > 0.0 && blocks(a, b, u_m1.xyz, u_mr.y)) return true;
+    if (u_m2.w > 0.0 && blocks(a, b, u_m2.xyz, u_mr.z)) return true;
+    if (u_m3.w > 0.0 && blocks(a, b, u_m3.xyz, u_mr.w)) return true;
+    return false;
+}
+
+float grainRand(ivec2 ip) {
+    uint h = uint(ip.x) * 1973u + uint(ip.y) * 9277u;
+    h ^= h >> 13; h *= 0x85ebca6bu; h ^= h >> 16;
+    return float(h & 0xffffffu) / 16777216.0;
+}
+
+void main() {
+    ivec2 ip = ivec2(gl_GlobalInvocationID.xy);
+    vec4 P = imageLoad(posImg, ip);
+    if (P.w < 0.5) return;
+    vec4 V = imageLoad(velImg, ip);
+    vec3 x = P.xyz, v = V.xyz;
+    float h = u_h / float(SUBSTEPS);
+    for (int k = 0; k < SUBSTEPS; k++) {
+        v += 0.5 * h * acc(x);
+        x += h * v;
+        v += 0.5 * h * acc(x);
+        vec3 rr = x - u_star.xyz;
+        float r2 = max(dot(rr, rr), 1e-6);
+        vec3 rh = rr * inversesqrt(r2);
+        vec3 vr = v - u_starV;
+        v -= h * (u_prK * u_starLum / r2) * (dot(vr, rh) * rh + vr);
+        if (u_hand.w > 0.0) {
+            vec3 dh = x - u_hand.xyz;
+            float d2 = dot(dh, dh);
+            v += h * u_hand.w * exp(-d2 / (u_handR * u_handR)) * dh * inversesqrt(max(d2, 1e-8));
+        }
+        for (int a = 0; a < 3; a++)
+            if (abs(x[a]) > u_boxW && x[a] * v[a] > 0.0) v[a] = -u_wallE * v[a];
+    }
+    if (u_flare > 0.0) {
+        vec3 rh = normalize(x - u_star.xyz);
+        float cone = max(dot(rh, u_flareDir), 0.0);
+        v += u_flareDir * (u_flare * u_h * 0.05 * pow(cone, 3.0));
+    }
+    bool smp = ((ip.x & 15) == 0) && ((ip.y & 15) == 0);
+    int hitSlot = -1;
+    if (dot(x - u_star.xyz, x - u_star.xyz) < u_starR * u_starR) hitSlot = 1;
+    else if (inside(x, u_m0, u_mr.x)) hitSlot = 2;
+    else if (inside(x, u_m1, u_mr.y)) hitSlot = 3;
+    else if (inside(x, u_m2, u_mr.z)) hitSlot = 4;
+    else if (inside(x, u_m3, u_mr.w)) hitSlot = 5;
+    if (hitSlot > 0) {
+        if (smp) imageAtomicAdd(cntImg, ivec2(u_cbase + hitSlot, 0), 1u);
+        imageStore(posImg, ip, vec4(x, 0.0));
+        return;
+    }
+    if (smp && u_countLive == 1) imageAtomicAdd(cntImg, ivec2(u_cbase, 0), 1u);
+    if (u_gridOn == 1 && ((ip.x & 3) == 0) && ((ip.y & 3) == 0)) {
+        ivec2 gc = ivec2(floor((x.xy + RING_GRID_HALF) * (float(RING_GRID_N) / (2.0 * RING_GRID_HALF))));
+        if (gc.x >= 0 && gc.y >= 0 && gc.x < RING_GRID_N && gc.y < RING_GRID_N) imageAtomicAdd(gridImg, gc, 1u);
+    }
+    imageStore(posImg, ip, vec4(x, 1.0));
+    imageStore(velImg, ip, vec4(v, 0.0));
+
+    vec3 rel = x - u_ro;
+    float z = dot(rel, u_fw);
+    if (z <= 0.0) return;
+    vec2 uv = vec2(dot(rel, u_rt), dot(rel, u_up)) / z;
+    float m = float(min(u_canvas.x, u_canvas.y));
+    vec2 px = uv / (2.0 * u_fov) * m + 0.5 * vec2(u_canvas);
+    ivec2 q = ivec2(floor(px));
+    if (q.x < 0 || q.y < 0 || q.x >= u_canvas.x || q.y >= u_canvas.y) return;
+    if (blockedAny(u_ro, x)) return;
+    bool shade = false;
+    vec3 toS = u_star.xyz - x;
+    float dS = length(toS);
+    vec3 sEdge = x + toS * (1.0 - u_starR / dS);
+    if (u_m0.w > 0.0 && blocks(x, sEdge, u_m0.xyz, u_mr.x)) shade = true;
+    if (u_m1.w > 0.0 && blocks(x, sEdge, u_m1.xyz, u_mr.y)) shade = true;
+    if (u_m2.w > 0.0 && blocks(x, sEdge, u_m2.xyz, u_mr.z)) shade = true;
+    if (u_m3.w > 0.0 && blocks(x, sEdge, u_m3.xyz, u_mr.w)) shade = true;
+    float b = (shade ? SHADOW_K : 1.0) / (dS * dS) * u_starLum;
+    float w = b * u_splatK;
+    uint iw = uint(w);
+    if (grainRand(ip) < fract(w)) iw++;
+    if (iw > 0u) imageAtomicAdd(accImg, q, iw);
+}
+#endif
+
+#ifdef K_SPAWN
+layout(local_size_x = 256) in;
+layout(rgba32f, binding = 0) uniform image2D posImg;
+layout(rgba32f, binding = 1) uniform image2D velImg;
+uniform vec3 u_ec, u_ev, u_ed;
+uniform float u_eR, u_es, u_ecos;
+uniform int u_en, u_eoff, u_epw, u_eseed;
+float rnd(uint x) {
+    x ^= x >> 16; x *= 0x7feb352du; x ^= x >> 15; x *= 0x846ca68bu; x ^= x >> 16;
+    return (float(x >> 8) + 0.5) / 16777216.0;
+}
+void main() {
+    int i = int(gl_GlobalInvocationID.x);
+    if (i >= u_en) return;
+    int slot = (u_eoff + i) % (u_epw * u_epw);
+    ivec2 ip = ivec2(slot % u_epw, slot / u_epw);
+    uint s = uint(i) * 3u + uint(u_eseed) * 2654435761u;
+    float ct = 1.0 - rnd(s) * (1.0 - u_ecos);
+    float sn = sqrt(max(0.0, 1.0 - ct * ct)), ph = 6.2831853 * rnd(s + 1u);
+    vec3 d = normalize(u_ed);
+    vec3 t1 = normalize(cross(d, abs(d.z) < 0.9 ? vec3(0.0, 0.0, 1.0) : vec3(1.0, 0.0, 0.0)));
+    vec3 t2 = cross(d, t1);
+    vec3 n = d * ct + (t1 * cos(ph) + t2 * sin(ph)) * sn;
+    float sp = u_es * min(-log(rnd(s + 2u)), 6.0);
+    imageStore(posImg, ip, vec4(u_ec + n * u_eR * 1.03, 1.0));
+    imageStore(velImg, ip, vec4(u_ev + n * sp, 0.0));
+}
+#endif
+
+#ifdef K_SPAWNR
+layout(local_size_x = 256) in;
+layout(rgba32f, binding = 0) uniform image2D posImg;
+layout(rgba32f, binding = 1) uniform image2D velImg;
+layout(r32ui, binding = 3) uniform uimage2D cntImg;
+uniform vec3 u_ec, u_ev, u_ed;
+uniform float u_eR, u_es, u_ecos;
+uniform int u_en, u_escan, u_eoff, u_epw, u_eseed;
+float rnd(uint x) {
+    x ^= x >> 16; x *= 0x7feb352du; x ^= x >> 15; x *= 0x846ca68bu; x ^= x >> 16;
+    return (float(x >> 8) + 0.5) / 16777216.0;
+}
+void main() {
+    int i = int(gl_GlobalInvocationID.x);
+    if (i >= u_escan) return;
+    int slot = (u_eoff + i) % (u_epw * u_epw);
+    ivec2 ip = ivec2(slot % u_epw, slot / u_epw);
+    if (imageLoad(posImg, ip).w > 0.5) return;
+    uint k = imageAtomicAdd(cntImg, ivec2(14, 0), 1u);
+    if (int(k) >= u_en) return;
+    uint s = k * 3u + uint(u_eseed) * 2654435761u;
+    float ct = 1.0 - rnd(s) * (1.0 - u_ecos);
+    float sn = sqrt(max(0.0, 1.0 - ct * ct)), ph = 6.2831853 * rnd(s + 1u);
+    vec3 d = normalize(u_ed);
+    vec3 t1 = normalize(cross(d, abs(d.z) < 0.9 ? vec3(0.0, 0.0, 1.0) : vec3(1.0, 0.0, 0.0)));
+    vec3 t2 = cross(d, t1);
+    vec3 n = d * ct + (t1 * cos(ph) + t2 * sin(ph)) * sn;
+    float sp = u_es * min(-log(rnd(s + 2u)), 6.0);
+    imageStore(posImg, ip, vec4(u_ec + n * u_eR * 1.03, 1.0));
+    imageStore(velImg, ip, vec4(u_ev + n * sp, 0.0));
+}
+#endif

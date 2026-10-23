@@ -6,6 +6,7 @@ pypng
 Pillow
 python-xlib
 scipy
+rebound      # Ringbox
 # optional: paho-mqtt (contrib/droidpad-shader-bridge)
 # optional, bakes only:
 #   OpenEXR   (skycube_unpack.py)

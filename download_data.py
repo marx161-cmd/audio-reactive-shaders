@@ -1,14 +1,17 @@
 #!/usr/bin/env python3
-"""Download the shaders' data into textures/ (and phone/backdrops/), ~16 GB for everything.
+"""Download the shaders' data into textures/ (and phone/backdrops/), ~17 GB for everything.
 
 Hosted as a Hugging Face dataset. Standard library only; resumes partial
 downloads and checks every file's SHA-256. Pick what you need:
 
     python3 download_data.py                  # everything
-    python3 download_data.py kerr             # Kerr-Black-Hole-Visualizer, ~6.6 GB
+    python3 download_data.py kerr             # the three Kerr shaders, ~7 GB
     python3 download_data.py nebulabrot       # Nebulabrot-Infinite-Dive, ~9.1 GB
     python3 download_data.py diamonds         # both stained-glass diamonds, ~44 MB
+    python3 download_data.py ringbox          # Ringbox, ~16 MB
     python3 download_data.py embers           # Ember-Flock-Metal-Pit, ~130 MB
+    python3 download_data.py dwarf            # Brown-Dwarf + Brown-Dwarf-Glass-Box, ~3.3 GB (incl. the sky)
+    python3 download_data.py gems             # Armillary-Gem-Sphere + Disnub-Diamond-Checker-Tunnel, ~175 MB
     python3 download_data.py tunnel           # Disnub-Diamond-Checker-Tunnel, ~18 MB
     python3 download_data.py phone            # wall images for the phone wallpapers, ~18 MB
     python3 download_data.py --check [...]    # only verify what's already there
@@ -18,7 +21,9 @@ the files are (see README "Rebuilding the data"):
   textures/kerr_v7/kn/paths32.npy     light paths around the Kerr-Newman hole,
                                       32 layers of 2410x2410 (kn_bake_modal.py)
   textures/kerr_v7/kn/sky.npy         where each pixel's light ends up on the sky
+  textures/kerr_v7/kn/lens_inv*.npy   the same bake inverted into a lens grid (lens_inv_bake.py)
   textures/kerr_v7/kn_disk_table_r2_20.npy  disk emission table (kn_disk.py)
+  textures/slurp/gasbake_flip.npy     the torn star's gas, a pre-lensed flipbook (85 frames)
   textures/starfield/gaia_cube_g117_max/*   Gaia DR3 stars (G < 11.7) as a BC6H
                                       cube map (tools/gaia_fetch.py, gaia_cube_bake.py)
   textures/starfield/nebula_photo4.npy      Milky Way dust + nebula photo map
@@ -27,6 +32,10 @@ the files are (see README "Rebuilding the data"):
   textures/nebulabrot/*.npy           Buddhabrot density bakes (nebula_bake_modal.py)
   textures/illusion_diamond/backdrops/*     stained-glass windows + their pane data,
                                       the checker tunnel
+  textures/stained_glass_space/*.png  the glass box walls
+  textures/moon_sphere/, ringbox/     moon and sun surface maps
+  textures/brown_dwarf/, fbm_drop_v3/ lightning decal / bolt atlases (grown on the GPU, dielectric breakdown)
+  textures/fbm_drop_v6/*              the gem sphere's backdrop image + its depth and normals
   phone/backdrops/*.png               wall images for the phone wallpapers
 """
 import argparse
@@ -45,9 +54,9 @@ FILES = [
     ("kerr", 2973747328, "e852551dd73285218e51e2517535ca4938387a3292f79461e59965ab2302fc59", "textures/kerr_v7/kn/paths32.npy"),
     ("kerr", 371718528, "68da545889f63b11111b8527daa004ea766ec30dc023fdb1d4aee75872c54d61", "textures/kerr_v7/kn/sky.npy"),
     ("kerr", 16512, "aa0e1a6ae8d8cf350c470ec6eaf110fc5928d89435334a0c5d288f422fa083f5", "textures/kerr_v7/kn_disk_table_r2_20.npy"),
-    ("kerr", 8595, "1f6689877e4d954a76590a1cab48f650a5436ece006539a9c4fc0ed844fb0daa", "textures/starfield/gaia_cube_g117_max/gaia_cube.json"),
-    ("kerr", 2147483808, "1597f135630c724fa5693bc2bb3a37972740d5bed25de056267a51a551d2b8bd", "textures/starfield/gaia_cube_g117_max/sky64k_bc6h.bin"),
-    ("kerr", 1073741952, "a2a3754eca8516916506b626152c067d453770c9705225b04f9e41bc6be32f3f", "textures/starfield/nebula_photo4.npy"),
+    ("kerr dwarf", 8595, "1f6689877e4d954a76590a1cab48f650a5436ece006539a9c4fc0ed844fb0daa", "textures/starfield/gaia_cube_g117_max/gaia_cube.json"),
+    ("kerr dwarf", 2147483808, "1597f135630c724fa5693bc2bb3a37972740d5bed25de056267a51a551d2b8bd", "textures/starfield/gaia_cube_g117_max/sky64k_bc6h.bin"),
+    ("kerr dwarf", 1073741952, "a2a3754eca8516916506b626152c067d453770c9705225b04f9e41bc6be32f3f", "textures/starfield/nebula_photo4.npy"),
     ("kerr", 6294656, "11d18263c4320f824778220f35e9fea97801e131a02fe11c519afa9e5928a012", "textures/pulsar_orrery/dwarf.npy"),
     ("kerr", 524928, "c27bb430bd96ba4ab87ca54cb7018cc9d7553ca45441f7508d40d35b7e86fd2b", "textures/pulsar_orrery/chromo.npy"),
     ("kerr", 1574528, "fb6c8e7dce56ad6bc481858949ee4ee3d6528e1f8a0a9d77e801397349a278d6", "textures/pulsar_orrery/giant.npy"),
@@ -67,7 +76,7 @@ FILES = [
     ("embers", 22786177, "249bd9ecdaa148f9eeda19d57818ac47ce7b73fe6da8533e600c35f3bc06be36", "textures/illusion_diamond/backdrops/sg_78150_glass_data.png"),
     ("embers", 22087115, "cdff1c7ac530924af2e12552d2c92e5dacc9f91a9cd3a718d2eec85c61106ee0", "textures/illusion_diamond/backdrops/sg_78151_glass.png"),
     ("embers", 21706972, "1a1f7e9a39f0d50938cc62a72e32af54571a6ca66ad73aaf7bef5cae684e2d73", "textures/illusion_diamond/backdrops/sg_78151_glass_data.png"),
-    ("tunnel", 18282545, "9dc21b4074536cab455d96f8994d6000ca2594cc3c8cf0b28ac384c51b760e60", "textures/illusion_diamond/backdrops/tunnel_cc.png"),
+    ("tunnel gems", 18282545, "9dc21b4074536cab455d96f8994d6000ca2594cc3c8cf0b28ac384c51b760e60", "textures/illusion_diamond/backdrops/tunnel_cc.png"),
     ("phone", 3147687, "51e9d6d6f43f011302545b20e1b25f5497395036e842233ee0ad8c88dabc2b2d", "phone/backdrops/dio_backC.png"),
     ("phone", 1970166, "a18695736f56ee8d4da52b069c758304c7864bc9ee19656bb1de436f93e82204", "phone/backdrops/dio_botC.png"),
     ("phone", 1013644, "502d525cd73ba7611207f3c4fdbb9a1f96197b199d7948e06ed5da118049d965", "phone/backdrops/dio_botS.png"),
@@ -77,6 +86,23 @@ FILES = [
     ("phone", 979830, "f2b27e3b545639f3224081d20ca570e3fc7614fe8fa8a397c6860b2e8bb00034", "phone/backdrops/dio_wlS.png"),
     ("phone", 3491918, "909d45d77d3b0288f8b08f228e3e1d1bcb5ce68ea0dbcaf807a1c9ab58c15781", "phone/backdrops/dio_wrC.png"),
     ("phone", 932987, "71bcf132e6e450dcaa977c1bca32d866e9362e93b1cb247b6df48e887da51c0c", "phone/backdrops/dio_wrS.png"),
+    ("kerr", 401080448, "901e6c117484bb11f50a1f9f3bee4c462c974f715f5b3dd35a08aeed9c2b84e4", "textures/slurp/gasbake_flip.npy"),
+    ("kerr", 9633920, "9d98f214a05a153c3c652db4a89bef988704b14f39ad16e56817c8f2ba6292f3", "textures/kerr_v7/kn/lens_inv.npy"),
+    ("kerr", 2359424, "3f81b434a94c6b30fd57bfd7694b820ae1b20f0da0f58a318629af1747393c50", "textures/kerr_v7/kn/lens_inv_count.npy"),
+    ("ringbox dwarf", 10063546, "83ee217582046454b579502397e223ebd02fb5de28b17bf9a2ebd6f5974978a2", "textures/moon_sphere/iChannel0.png"),
+    ("ringbox", 3105072, "716722efb2313b5246d8dab55af4e75b8526efec4cf704c766bcd33be8f027d8", "textures/ringbox/sun_photo.png"),
+    ("ringbox", 2767776, "a9fd336d55a5c7de2e6a9f42979a438944e7d1a9be506b354d7f388a6ee12d0a", "textures/ringbox/sun_euv.png"),
+    ("dwarf", 5243008, "6da8c0d1fe4a1764324cda251e2b0933c3395ac14da187093b720c6afa5bc444", "textures/brown_dwarf/bolt_decals_u8.npy"),
+    ("dwarf", 11286494, "0c878262cf86bdd2a5a6d3155a647c9d0907f5d63d14085444081d45d72c2f9e", "textures/stained_glass_space/floor-backwall.png"),
+    ("dwarf", 13376380, "2aa49890513ef45a51bb5fe7c66737dda43495b28ac156b6f9b2b99dbe281a10", "textures/stained_glass_space/long-wall-l.png"),
+    ("dwarf", 15214456, "ffa711bcdb6186f838025c09f957af6a587b1cf310a7b69f02b72cac2b9aabd4", "textures/stained_glass_space/long-wall-r.png"),
+    ("dwarf", 21727378, "b13beffe0b6f4f99e84a2e0716634db765f4158407871ebbe8daf13d52f847ff", "textures/stained_glass_space/short-wall.png"),
+    ("dwarf", 28745766, "a4fd29acc9be4783342aedd3f44b2ba55a5702299a196d551f283dd672980b0e", "textures/stained_glass_space/short-wall-top.png"),
+    ("gems", 1310848, "6b317526d30ff93d78810b72d7e7bc1734be364b19a917950075ec82049464bc", "textures/fbm_drop_v3/bolts_u8.npy"),
+    ("gems", 37136, "3722ed00aeefa02968bfb77d7753cd7ff6ec5703bfe58ad5f0a081e5df0bc297", "textures/fbm_drop_v3/hops_f32.npy"),
+    ("gems", 35998016, "7c499eb5182a653942fa23599e03b69605f9275331cc873b9e883ebc6a71fef8", "textures/fbm_drop_v6/backdrop_u8.npy"),
+    ("gems", 71995904, "cf95594cc9a61f3b97e76b236e82b18480cc2ccee7f86818d706253d2a614965", "textures/fbm_drop_v6/backdrop_normal_f16.npy"),
+    ("gems", 47997312, "2e7362be46ef35c4c086ff660a361ba6460994c1f8c9d8f8a71d6e9d39c9c0bd", "textures/fbm_drop_v6/backdrop_depth_f32.npy"),
 ]
 GROUPS = sorted({g for gs, *_ in FILES for g in gs.split()})
 

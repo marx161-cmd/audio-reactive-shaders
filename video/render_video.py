@@ -11,7 +11,7 @@ to a display surface; here everything goes to an FBO and out to a file.
 
 Usage:
     .venv/bin/python render_video.py \
-        --shader wrapped/Colorful_FBM.glsl \
+        --shader wrapped/my_shader.glsl \
         --audio track.flac --fps 60 \
         --width 1080 --height 2410 -o out.mp4
     .venv/bin/python render_video.py --shader ... --features features.npz \

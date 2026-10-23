@@ -1,0 +1,13 @@
+{
+  "canvas": [2410, 2410],
+  "fps": 30,
+  "buffers": [],
+  "wiring": {},
+  "compute": {"script": "sim.py"},
+  "static_textures": {"u_moonMap": "textures/moon_sphere/iChannel0.png",
+                      "u_sunPhoto": "textures/ringbox/sun_photo.png",
+                      "u_sunEuv": "textures/ringbox/sun_euv.png"},
+  "static_texture_filters": {"u_moonMap": "linear_mip",
+                             "u_sunPhoto": "linear_wrap",
+                             "u_sunEuv": "linear_wrap"}
+}
